@@ -1,0 +1,23 @@
+# 用户配置（含真实 Cookie、账号、密码，禁止提交）
+config.lua
+
+# 日志文件
+*.log
+
+# KOReader settings 目录中生成的 koobone.lua 不提交（每个用户自己的）
+settings/
+
+# 缓存（EPUB、封面、pages）
+cache/
+epub/
+tmp/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+.idea/
+.vscode/
+
+koobone.koplugin.zip
