@@ -472,7 +472,20 @@ function ShelfView:show(series_id_opt, skip_refresh)
 
     -- 顶部操作区（不加分隔符）
     if not is_vol_view then
-        -- 系列列表层：刷新书架按钮（用 _miu_action_row 标记为操作行）
+        -- 系列列表层：刷新书架 + 排序
+        local current_sort = settings:get_shelf_sort()
+        local sort_label_map = {
+            uptime = _("按更新时间"),
+            vol_name = _("按名称"),
+            last_read = _("按最后阅读"),
+        }
+        items[#items + 1] = {
+            _miu_action_row = true,
+            action_text = _("排序: ") .. (sort_label_map[current_sort] or current_sort),
+            callback = function()
+                self:_show_sort_dialog()
+            end,
+        }
         items[#items + 1] = {
             _miu_action_row = true,
             action_text = _("⟳ 刷新书架"),
@@ -490,7 +503,7 @@ function ShelfView:show(series_id_opt, skip_refresh)
         }
         items[#items + 1] = {
             _miu_action_row = true,
-            action_text = _("排序方式: ") .. (sort_label_map[current_sort] or current_sort),
+            action_text = _("排序: ") .. (sort_label_map[current_sort] or current_sort),
             callback = function()
                 self:_show_sort_dialog()
             end,
@@ -625,14 +638,10 @@ function ShelfView:show(series_id_opt, skip_refresh)
             }
         end
 
-        -- 从 series_list 查系列名做标题
-        local series_list = bookshelf:get_series_list()
+        -- 从卷列表中取系列名做标题（避免重复调用 get_series_list）
         local series_title = ""
-        for _idx, s in ipairs(series_list) do
-            if tostring(s.id) == tostring(series_id_opt) then
-                series_title = s.title or ""
-                break
-            end
+        if display_vols and display_vols[1] then
+            series_title = display_vols[1].series or ""
         end
         menu_title = series_title ~= "" and series_title or _("系列详情")
     end
@@ -712,27 +721,36 @@ end
 function ShelfView:_show_sort_dialog()
     if not (ok_UIManager and ok_ButtonDialog) then return end
     local self_ref = self
+    local function choose(sort_key)
+        if self_ref._sort_dialog then
+            pcall(function() UIManager:close(self_ref._sort_dialog) end)
+            self_ref._sort_dialog = nil
+        end
+        self_ref:update_sort(sort_key)
+    end
     local buttons = {
         {
             {
                 text = _("按更新时间"),
-                callback = function()
-                    self_ref:update_sort("uptime")
-                end,
+                callback = function() choose("uptime") end,
             },
             {
                 text = _("按名称"),
-                callback = function()
-                    self_ref:update_sort("vol_name")
-                end,
+                callback = function() choose("vol_name") end,
+            },
+        },
+        {
+            {
+                text = _("按最后阅读"),
+                callback = function() choose("last_read") end,
             },
         },
     }
-    local dlg = ButtonDialog:new{
+    self._sort_dialog = ButtonDialog:new{
         title = _("选择排序方式"),
         buttons = buttons,
     }
-    UIManager:show(dlg)
+    UIManager:show(self._sort_dialog)
 end
 
 function ShelfView:_refresh_shelf()

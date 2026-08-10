@@ -61,7 +61,6 @@ function Reader:new(plugin)
         _menu_visible = false,
         _menu_auto_hide_handle = nil,
         _widget = nil,
-        _preloading = false,
         _image_widget = nil,
         _top_menu = nil,
         _bottom_menu = nil,
@@ -69,29 +68,9 @@ function Reader:new(plugin)
         _progress_widget = nil,
         _page_text_widget = nil,
         _night_mode = false,
-        _last_preload_msg = "",
-        _preload_msg_handle = nil,
     }
-    -- 注册预下载进度回调（在构造函数中设置，使其能够访问 self）
-    obj._on_preload_progress = function(msg)
-        local self_ref = obj
-        if self_ref._preload_msg_handle then
-            -- 取消之前的定时任务
-            local ok_tm, tm = pcall(require, "ui/time")
-            if ok_tm and tm and tm.removeSchedulerItem then
-                tm.removeSchedulerItem(self_ref._preload_msg_handle)
-            end
-        end
-        -- 显示提示信息
-        _show_info(msg)
-        -- 3 秒后自动消失
-        local ok_sched, sched = pcall(require, "scheduler")
-        if ok_sched and sched then
-            self_ref._preload_msg_handle = sched.schedule(function()
-                self_ref._preload_msg_handle = nil
-            end, 3)
-        end
-    end
+    -- 注意: 预下载逻辑已移至 main.lua 的 open_comic/_trigger_preload 中处理，
+    -- 此处不再保留预下载进度回调相关代码。
     return setmetatable(obj, self)
 end
 
@@ -172,17 +151,68 @@ function Reader:open_comic(vol_or_fmd)
             _show_info(_("下载模块未初始化"))
             return false
         end
-        _show_info(_("开始下载: ") .. tostring(vol.title or fmd))
         local reader_self = self
         local download_vol = vol
+
+        -- 生成 IPC 文件路径（子进程写进度，父进程读）
+        local ipc_paths = self.download:ipc_paths(fmd)
+        self.download:ipc_cleanup(ipc_paths)
+
+        -- 创建进度对话框（在父进程中显示，子进程通过文件 IPC 更新）
+        local ok_DLProgress, DownloadProgress = pcall(require, "koobone.download_progress")
+        local progress_dialog = nil
+        local poll_handle = nil
+        if ok_DLProgress and DownloadProgress and ok_UIManager and UIManager then
+            progress_dialog = DownloadProgress:new{
+                title = _("下载中"),
+                on_cancel = function()
+                    reader_self.download:ipc_send_cancel(ipc_paths.cancel_file)
+                    if progress_dialog then
+                        progress_dialog:close()
+                        progress_dialog = nil
+                    end
+                end,
+                on_background = function()
+                    if progress_dialog then
+                        progress_dialog:close()
+                        progress_dialog = nil
+                    end
+                end,
+            }
+            UIManager:show(progress_dialog)
+            progress_dialog:setState{
+                stage = "prepare",
+                vol_name = tostring(vol.title or fmd),
+                percent = 0,
+            }
+            -- 轮询进度文件
+            local function poll_progress()
+                if not progress_dialog then return end
+                local data = reader_self.download:ipc_read_progress(ipc_paths.progress_file)
+                if data then
+                    progress_dialog:setState{
+                        stage = data.stage,
+                        vol_name = data.vol_name,
+                        download_bytes = data.current,
+                        expected_size = data.total,
+                        message = data.message,
+                    }
+                end
+                poll_handle = UIManager:scheduleIn(0.5, poll_progress)
+            end
+            poll_handle = UIManager:scheduleIn(0.5, poll_progress)
+        end
 
         -- 用 Async.run 在子进程中下载，不卡 UI
         Async.run(
             function()
                 -- 子进程中执行: 下载 + 解压 + 解析
-                -- 注意: 子进程中不能访问主进程的 _state/UIManager，所以不传 progress_callback
+                -- 通过 IPC 文件传递进度给父进程
                 local ok_pcall, v, pages, edir, err = pcall(function()
-                    return reader_self.download:ensure_epub(download_vol, nil)
+                    return reader_self.download:ensure_epub(download_vol, nil, {
+                        progress_file = ipc_paths.progress_file,
+                        cancel_file = ipc_paths.cancel_file,
+                    })
                 end)
                 if ok_pcall and pages and not err then
                     return { ok = true, vol = v or download_vol, pages = pages, edir = edir }
@@ -191,6 +221,22 @@ function Reader:open_comic(vol_or_fmd)
                 end
             end,
             function(ok_run, result, err_run)
+                -- 停止轮询
+                if poll_handle and ok_UIManager and UIManager then
+                    pcall(function() UIManager:unschedule(poll_handle) end)
+                    poll_handle = nil
+                end
+                -- 关闭进度对话框
+                if progress_dialog and ok_UIManager and UIManager then
+                    progress_dialog:setState{ stage = result and result.ok and "done" or "error", percent = result and result.ok and 1 or 0 }
+                    UIManager:scheduleIn(0.5, function()
+                        if progress_dialog then progress_dialog:close() end
+                    end)
+                    progress_dialog = nil
+                end
+                -- 清理 IPC 文件
+                reader_self.download:ipc_cleanup(ipc_paths)
+
                 -- 主进程中回调: 更新 UI
                 if not ok_run then
                     _show_info(_("下载失败: ") .. tostring(err_run))
@@ -826,26 +872,6 @@ end
 
 function Reader:_apply_menu_visibility()
     if not (ok_UIManager and UIManager) then return end
-    local screen_w, screen_h = self:_screen_size()
-    local menu_h = self:_get_menu_height()
-
-    if not self._overlay_mask then
-        if ok_WidgetContainer and WidgetContainer then
-            local ok_bb, bb = pcall(function()
-                local w_color = ok_Blitbuffer and Blitbuffer and Blitbuffer.COLOR_WHITE or 0
-                local bb_ok, bbv
-                if ok_Blitbuffer then
-                    bb_ok, bbv = pcall(function()
-                        return Blitbuffer.new(screen_w, screen_h, ok_Device and Device.screen and Device.screen.fb_bb or nil)
-                    end)
-                    if bb_ok and bbv then
-                        pcall(function() bbv:fill(w_color) end)
-                    end
-                end
-                return bbv
-            end)
-        end
-    end
 
     if self._top_menu and self._top_menu.show then
         if self._menu_visible then
@@ -1059,7 +1085,6 @@ function Reader:close_reader(confirm_unsync_opt)
         self._menu_visible = false
         self._overlay_mask = nil
         self._night_mode = false
-        self._preloading = false
 
         Log.info("[Reader] 阅读器已关闭")
     end

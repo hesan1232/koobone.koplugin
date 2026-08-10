@@ -150,7 +150,7 @@ local KoobonePlugin = WidgetContainer:extend{
     name = "koobone",
     is_doc_only = false,
     fullname = _("Koobone 漫画"),
-    version = "0.1.0",
+    version = "0.2.0",
 }
 
 function KoobonePlugin:isCurrentDocKoobone()
@@ -256,7 +256,7 @@ function KoobonePlugin:_add_to_menu(menu_table, is_reader)
         {
             text = _("关于插件"),
             callback = function()
-                self_ref:showInfo(T(_("Koobone 漫画插件 v%1\n\n在 KOReader 中阅读 Koobone 漫画库。\n\n核心特性:\n• 书架浏览与搜索\n• 漫画下载与缓存\n• 阅读进度同步\n• 排序与预下载"), self_ref.version))
+                self_ref:showInfo(T(_("Koobone 漫画插件 v%1\n\n核心特性:\n• 书架浏览与排序（按更新/名称/最后阅读）\n• 漫画下载与断点续传（带进度条）\n• EPUB 缓存与 LRU 自动清理\n• 阅读进度云端同步\n• 智能预下载下 N 卷\n• 后台静默刷新不打断阅读"), self_ref.version))
             end,
         },
     }
@@ -305,11 +305,9 @@ function KoobonePlugin:showBookshelf(series_id_opt)
         -- 后续打开只显示本地缓存，用户可手动点击"刷新书架"按钮更新
         if not self._shelf_initialized then
             self._shelf_initialized = true
-            self:showBusy(_("正在刷新书架..."))
             Async.run(function()
                 return self_ref.bookshelf:refresh(true)
             end, function(ok_refresh, refresh_result, refresh_err)
-                self_ref:closeBusy()
                 if not ok_refresh then
                     Log.error("[Koobone] refresh shelf failed:", tostring(refresh_err))
                     if is_auth_error(refresh_err) then
@@ -318,11 +316,9 @@ function KoobonePlugin:showBookshelf(series_id_opt)
                     return
                 end
                 if refresh_result and type(refresh_result) == "table" and #refresh_result > 0 then
-                    self_ref:showInfo(_("书架已刷新"))
-                    -- 刷新完成后重新显示书架
-                    if self_ref.shelf_view then
-                        self_ref.shelf_view:show(series_id_opt, true)
-                    end
+                    Log.info("[Koobone] 后台刷新书架完成, 共" .. #refresh_result .. "卷")
+                    -- 不自动重新显示书架，避免打断用户操作（如在系列内下载漫画时闪回）
+                    -- 数据已更新到本地缓存，用户下次打开书架或手动刷新时即可看到最新数据
                 else
                     Log.warn("[Koobone] refresh failed: result is empty or nil")
                 end
@@ -475,6 +471,7 @@ body {
 end
 
 -- 预下载触发：按书架排序预下载当前卷后续的 N 卷（使用队列机制）
+-- 预下载是后台静默操作，不弹任何提示，避免干扰阅读
 function KoobonePlugin:_trigger_preload(current_vol)
     if not current_vol then return end
     if not self.download then return end
@@ -528,19 +525,9 @@ function KoobonePlugin:_trigger_preload(current_vol)
     end
 
     Log.info("[Koobone] 启动预下载：当前卷=" .. current_fmd .. " 系列=" .. tostring(series_id) .. " 预下载" .. #to_preload .. "卷")
-    self:showInfo(T(_("开始预下载后续 %1 卷"), tostring(#to_preload)))
+    -- 预下载是静默后台操作，不弹提示
 
-    -- 订阅队列状态变化，显示进度提示
-    local listener_id = "preload_" .. current_fmd
-    self.download:subscribe_queue(listener_id, function(status)
-        if status and status.total > 0 then
-            local completed = status.total - status.queued - status.active
-            local msg = T(_("预下载进度: %1/%2"), tostring(completed), tostring(status.total))
-            self_ref:showInfo(msg)
-        end
-    end)
-
-    -- 使用队列机制添加预下载任务
+    -- 使用队列机制添加预下载任务（不订阅队列状态，不弹进度提示）
     local added, skipped = self.download:enqueue_batch(to_preload, {
         on_success = function(vol, epub_path)
             Log.info("[Koobone] 预下载成功: " .. tostring(vol.title or vol.fmd))
@@ -550,17 +537,7 @@ function KoobonePlugin:_trigger_preload(current_vol)
         end,
     })
 
-    local msg = T(_("已将 %1 卷加入预下载队列"), tostring(added))
-    if skipped > 0 then
-        msg = msg .. T(_("，跳过 %1 卷(已下载)"), tostring(skipped))
-    end
-    Log.info("[Koobone] " .. msg)
-    self:showInfo(msg)
-
-    -- 60 秒后取消订阅（避免内存泄漏）
-    UIManager:scheduleIn(60, function()
-        self_ref.download:unsubscribe_queue(listener_id)
-    end)
+    Log.info("[Koobone] 预下载已将 " .. tostring(added) .. " 卷加入队列，跳过 " .. tostring(skipped) .. " 卷")
 end
 
 function KoobonePlugin:download_comic(vol, force)
@@ -614,10 +591,15 @@ function KoobonePlugin:_do_download_comic(vol, force_redownload)
         end)
     end
 
+    -- 生成子进程 IPC 文件路径（子进程写进度，父进程读）
+    local ipc_paths = self.download:ipc_paths(fmd)
+    self.download:ipc_cleanup(ipc_paths)  -- 清理上次残留
+
     -- 创建下载进度对话框
     local ok_DLProgress, DownloadProgress = pcall(require, "koobone.download_progress")
     local progress_dialog = nil
     local download_here = true  -- 标记是否在前台下载（用于"后台运行"切换）
+    local poll_handle = nil     -- 轮询定时器句柄
     if ok_DLProgress and DownloadProgress then
         local vol_title = (vol and (vol.title or vol.vol_name)) or fmd
         progress_dialog = DownloadProgress:new{
@@ -625,6 +607,8 @@ function KoobonePlugin:_do_download_comic(vol, force_redownload)
             on_cancel = function()
                 Log.info("[Koobone] 用户取消下载 fmd=" .. fmd)
                 self_ref._download_cancelled = true
+                -- 通过 IPC 文件通知子进程取消
+                self_ref.download:ipc_send_cancel(ipc_paths.cancel_file)
                 -- 关闭进度对话框
                 if progress_dialog then
                     progress_dialog:close()
@@ -652,14 +636,45 @@ function KoobonePlugin:_do_download_comic(vol, force_redownload)
         }
     end
 
+    -- 父进程轮询子进程写入的进度文件，更新对话框
+    local function stop_polling()
+        if poll_handle and UIManager then
+            pcall(function() UIManager:unschedule(poll_handle) end)
+            poll_handle = nil
+        end
+    end
+    local function poll_progress()
+        if not progress_dialog then return end
+        local data = self_ref.download:ipc_read_progress(ipc_paths.progress_file)
+        if data then
+            progress_dialog:setState{
+                stage = data.stage,
+                vol_name = data.vol_name,
+                download_bytes = data.current,
+                expected_size = data.total,
+                message = data.message,
+            }
+        end
+        poll_handle = UIManager:scheduleIn(0.5, poll_progress)
+    end
+    if progress_dialog and UIManager then
+        poll_handle = UIManager:scheduleIn(0.5, poll_progress)
+    end
+
     -- 在后台线程下载 EPUB 文件
     self._download_cancelled = false
     local download_task = Async.run(function()
         -- 只下载 EPUB 文件，不解压
-        -- 下载过程中通过 _state.updateDownloadProgress 更新进度
-        local epub_path = self_ref.download:download_epub_file(vol, progress_dialog, self_ref)
+        -- 通过 IPC 文件传递进度给父进程
+        local epub_path = self_ref.download:download_epub_file(vol, nil, self_ref, {
+            progress_file = ipc_paths.progress_file,
+            cancel_file = ipc_paths.cancel_file,
+        })
         return epub_path
     end, function(ok, epub_path, err)
+        -- 停止轮询
+        stop_polling()
+
         -- 关闭进度对话框（如果还存在的话）
         if progress_dialog then
             progress_dialog:setState{ stage = "done", percent = 1 }
@@ -668,6 +683,9 @@ function KoobonePlugin:_do_download_comic(vol, force_redownload)
             end
             progress_dialog = nil
         end
+
+        -- 清理 IPC 文件
+        self_ref.download:ipc_cleanup(ipc_paths)
 
         if self_ref._download_cancelled then
             self_ref:showInfo(_("下载已取消"))

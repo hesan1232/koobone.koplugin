@@ -17,7 +17,7 @@ local defaults = {
         auto_relogin = true,
     },
     shelf = {
-        sort_order = "uptime",
+        sort_order = "last_read",
         per_page = 25,
     },
     cache = {
@@ -630,6 +630,16 @@ function Settings:build_menu_items(plugin)
                             end,
                             callback = function()
                                 self:set_shelf_sort("vol_name")
+                                self:flush()
+                            end,
+                        },
+                        {
+                            text = _("按最后阅读"),
+                            checked_func = function()
+                                return self:get_shelf_sort() == "last_read"
+                            end,
+                            callback = function()
+                                self:set_shelf_sort("last_read")
                                 self:flush()
                             end,
                         },

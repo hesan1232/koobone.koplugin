@@ -183,6 +183,55 @@ local function format_size(bytes)
     end
 end
 
+-- ===== 子进程→父进程进度 IPC（基于文件）=====
+-- Async.run 通过 fork 在子进程中执行下载，子进程无法直接更新父进程的 UI。
+-- 通过临时文件传递进度：子进程写入 JSON，父进程轮询读取并更新对话框。
+-- 通过 cancel 文件传递取消信号：父进程创建文件，子进程检查文件是否存在。
+
+local function ipc_write_progress(file_path, data)
+    if not file_path then return end
+    pcall(function()
+        local json_str = H.json_encode(data)
+        if not json_str then return end
+        local tmp = file_path .. ".tmp"
+        local f = io.open(tmp, "w")
+        if not f then return end
+        f:write(json_str)
+        f:close()
+        os.rename(tmp, file_path)
+    end)
+end
+
+local function ipc_read_progress(file_path)
+    if not file_path then return nil end
+    local f = io.open(file_path, "r")
+    if not f then return nil end
+    local content = f:read("*a")
+    f:close()
+    if not content or content == "" then return nil end
+    return H.json_decode(content)
+end
+
+local function ipc_write_cancel(cancel_file)
+    if not cancel_file then return end
+    pcall(function()
+        local f = io.open(cancel_file, "w")
+        if f then f:write("1"); f:close() end
+    end)
+end
+
+local function ipc_check_cancel(cancel_file)
+    if not cancel_file then return false end
+    local f = io.open(cancel_file, "r")
+    if f then f:close(); return true end
+    return false
+end
+
+local function ipc_cleanup(progress_file, cancel_file)
+    pcall(os.remove, progress_file)
+    pcall(os.remove, cancel_file)
+end
+
 function Download:_do_http_download(url, save_tmp_path, expected_size, verify_ssl, fmd)
     local ltn12_mod = ltn12
     local is_https = url:find("^https://") == 1
@@ -301,7 +350,6 @@ end
 
 --- 带进度回调的 HTTP 下载
 function Download:_do_http_download_with_progress(url, save_tmp_path, expected_size, verify_ssl, fmd, progress_callback, cancel_check)
-    local ltn12_mod = ltn12
     local is_https = url:find("^https://") == 1
     local transport
     if is_https then
@@ -330,16 +378,47 @@ function Download:_do_http_download_with_progress(url, save_tmp_path, expected_s
         default_headers["Cookie"] = cookie
     end
 
-    local out_file = io.open(save_tmp_path, "wb")
+    local expected = tonumber(expected_size) or 0
+
+    -- ===== 断点续传: 检查本地已有部分文件 =====
+    local exist_size = 0
+    local resume_supported = false
+    local file_mode = "wb"
+    local existing_attr = lfs.attributes(save_tmp_path, "size")
+    if existing_attr and existing_attr > 0 then
+        exist_size = existing_attr
+        -- 如果已有大小 >= 预期大小，说明文件已完整，直接返回
+        if expected > 0 and exist_size >= expected then
+            Log.info("[KooboneDownload] 断点检测: 本地文件已完整 exist=" .. exist_size .. " expected=" .. expected)
+            if progress_callback then
+                progress_callback(exist_size, expected, "done", "断点检测: 文件已完整")
+            end
+            _state.updateDownloadProgress(exist_size, expected, "断点检测: 文件已完整")
+            return exist_size, nil
+        end
+        -- 加入 Range 头尝试续传
+        default_headers["Range"] = "bytes=" .. tostring(exist_size) .. "-"
+        resume_supported = true
+        file_mode = "a+b"
+        Log.info("[KooboneDownload] 断点续传: 从 " .. exist_size .. " 字节继续下载 (expected=" .. expected .. ")")
+        local resume_msg = "断点续传中..."
+        if progress_callback then
+            progress_callback(exist_size, expected, "resume", resume_msg)
+        end
+        -- 同步更新全局状态（后台下载时书架界面也能看到断点进度）
+        _state.updateDownloadProgress(exist_size, expected, resume_msg)
+    end
+
+    local out_file = io.open(save_tmp_path, file_mode)
     if not out_file then
         return nil, "无法打开临时文件写入: " .. save_tmp_path
     end
 
-    local downloaded = 0
-    local last_progress_bytes = 0
-    local last_progress_percent = -1
+    -- downloaded 从已有大小开始累计（用于进度显示）
+    local downloaded = exist_size
+    local last_progress_bytes = exist_size
+    local last_progress_percent = expected > 0 and math.floor((exist_size / expected) * 100) or -1
     local progress_chunk = 256 * 1024
-    local expected = tonumber(expected_size) or 0
 
     local last_ui_update = 0
     local cancelled = false
@@ -374,13 +453,11 @@ function Download:_do_http_download_with_progress(url, save_tmp_path, expected_s
             if should_update and (now - last_ui_update) >= 100 then
                 last_ui_update = now
                 last_progress_bytes = downloaded
-                -- 更新进度
+                local dl_msg = "下载中..."
                 if progress_callback then
-                    progress_callback(downloaded, expected, "downloading", string.format("下载中 %s/%s",
-                        format_size(downloaded), format_size(expected)))
+                    progress_callback(downloaded, expected, "downloading", dl_msg)
                 end
-                _state.updateDownloadProgress(downloaded, expected, string.format("下载中 %s/%s",
-                    format_size(downloaded), format_size(expected)))
+                _state.updateDownloadProgress(downloaded, expected, dl_msg)
             end
         end
         return chunk
@@ -395,7 +472,7 @@ function Download:_do_http_download_with_progress(url, save_tmp_path, expected_s
     local request_options = {
         url = url,
         sink = custom_sink,
-        timeout = 180,
+        timeout = 300,  -- 优化: 5分钟超时，适配 100MB 大文件 + Kindle 慢网络
         headers = default_headers,
     }
 
@@ -413,21 +490,57 @@ function Download:_do_http_download_with_progress(url, save_tmp_path, expected_s
         end
     end
 
+    -- 优化: 下载前暂停 GC，减少大文件流式写入时的 GC pause
+    local gc_was_running = collectgarbage("isrunning")
+    if gc_was_running then
+        collectgarbage("stop")
+    end
+
     local t0 = now_ms()
     local ok_trans, result1, result2, result3 = pcall(transport.request, request_options)
     out_file:close()
     local elapsed = now_ms() - t0
 
+    -- 优化: 下载后恢复 GC 并手动收尾
+    if gc_was_running then
+        collectgarbage("restart")
+        collectgarbage("collect")
+    end
+
     if cancelled then
+        -- 取消时保留 tmp 文件以便下次续传
+        Log.info("[KooboneDownload] 下载已取消，保留断点文件: " .. save_tmp_path .. " size=" .. downloaded)
         return nil, "下载已取消"
     end
 
     if not ok_trans then
+        -- 异常时也保留 tmp 文件以便续传
+        Log.warn("[KooboneDownload] HTTP异常，保留断点文件: " .. save_tmp_path .. " err=" .. tostring(result1))
         return nil, "HTTP连接异常: " .. tostring(result1)
     end
 
     local code = result2
+    -- 处理断点续传响应码
+    if resume_supported and code == 206 then
+        -- 服务器支持 Range，追加写入成功
+        Log.info("[KooboneDownload] 断点续传成功 206, downloaded=" .. downloaded .. " (elapsed=" .. math.floor(elapsed) .. "ms)")
+        return downloaded, nil
+    elseif resume_supported and code == 416 then
+        -- 416 Range Not Satisfiable: 本地文件已完整（或超出服务器文件大小）
+        Log.info("[KooboneDownload] 服务器返回 416，本地文件已完整 exist=" .. exist_size)
+        return exist_size, nil
+    elseif resume_supported and code == 200 then
+        -- 服务器不支持 Range，返回了完整内容。但我们的文件已用 "a+b" 打开追加写，
+        -- 这会导致重复数据！需要重新覆盖写。
+        -- 由于 out_file 已关闭，且 sink 已写入追加数据，文件已损坏，需删除重下。
+        Log.warn("[KooboneDownload] 服务器不支持 Range (返回 200)，断点文件已损坏，需删除重下")
+        pcall(os.remove, save_tmp_path)
+        return nil, "服务器不支持断点续传，请重新下载"
+    end
+
     if type(code) ~= "number" or code < 200 or code >= 300 then
+        -- 失败时保留 tmp 文件以便续传
+        Log.warn("[KooboneDownload] HTTP " .. tostring(code) .. " 保留断点文件 (elapsed=" .. math.floor(elapsed) .. "ms)")
         return nil, "HTTP " .. tostring(code) .. " (elapsed=" .. math.floor(elapsed) .. "ms)"
     end
 
@@ -454,9 +567,7 @@ function Download:_download_epub_file(vol, file_url, expected_size, file_md5)
     end
 
     local tmp_path = epub_path .. ".downloading"
-    if H.file_exists(tmp_path) then
-        pcall(os.remove, tmp_path)
-    end
+    -- 优化: 不再无条件删除 tmp 文件，保留用于断点续传
 
     local is_https = file_url:find("^https://") == 1
     local http_url = nil
@@ -478,16 +589,28 @@ function Download:_download_epub_file(vol, file_url, expected_size, file_md5)
     local strat_names = {}
     for _, s in ipairs(strategies) do table.insert(strat_names, s.name) end
     Log.info("[KooboneDownload] 策略列表(无进度): " .. table.concat(strat_names, ", ") .. " fmd=" .. fmd)
+    local prev_strat_url = nil
     for si, strat in ipairs(strategies) do
         Log.info("[KooboneDownload] 使用策略 " .. strat.name .. " (第" .. si .. "/" .. #strategies .. "个) verify=" .. tostring(strat.verify))
-        for attempt = 1, 3 do
+        -- 优化: 切换策略(URL变化)时删除 tmp 文件，同一策略重试则保留断点
+        if prev_strat_url and prev_strat_url ~= strat.url then
             if H.file_exists(tmp_path) then
+                Log.info("[KooboneDownload] 切换策略(无进度)，删除旧断点文件重新下载")
                 pcall(os.remove, tmp_path)
             end
-            _state.updateDownloadProgress(0, expected_size, "下载策略:" .. strat.name .. " 尝试" .. attempt .. "/3")
-            -- 使用 pcall 防止异常中断策略循环
+        end
+        prev_strat_url = strat.url
+        for attempt = 1, 3 do
+            -- 优化: 同一策略重试时不删除 tmp 文件，利用断点续传
+            local exist_bytes = self:_file_size(tmp_path)
+            if exist_bytes > 0 then
+                _state.updateDownloadProgress(exist_bytes, expected_size, "断点续传尝试" .. attempt .. "/3")
+            else
+                _state.updateDownloadProgress(0, expected_size, "下载策略:" .. strat.name .. " 尝试" .. attempt .. "/3")
+            end
+            -- 优化: 复用带断点续传的下载方法（传 nil 回调走无进度模式）
             local ok_call, size, err = pcall(function()
-                return self:_do_http_download(strat.url, tmp_path, expected_size, strat.verify, fmd)
+                return self:_do_http_download_with_progress(strat.url, tmp_path, expected_size, strat.verify, fmd, nil, nil)
             end)
             if not ok_call then
                 last_err = tostring(size or "unknown error")
@@ -536,11 +659,22 @@ function Download:_get_remote_file_size(url)
     end
 
     local response_headers = {}
+    local scheme_host = url:match("^(https?://[^/]+)") or ""
+    local head_headers = {
+        ["User-Agent"] = DESKTOP_UA,
+        ["Accept"] = "*/*",
+        ["Connection"] = "keep-alive",
+        ["Referer"] = scheme_host .. "/",
+    }
+    local cookie = self.settings:get_cookie()
+    if cookie and cookie ~= "" then
+        head_headers["Cookie"] = cookie
+    end
     local request_options = {
         method = "HEAD",
         url = url,
         sink = ltn12.sink.null(),
-        headers = response_headers,
+        headers = head_headers,
         timeout = 30,
     }
 
@@ -551,24 +685,31 @@ function Download:_get_remote_file_size(url)
         request_options.options = "all"
     end
 
-    local ok, result = pcall(transport.request, request_options)
+    local ok, result1, result2, result3 = pcall(transport.request, request_options)
     if not ok then
-        Log.warn("[KooboneDownload] HEAD request failed: " .. tostring(result))
+        Log.warn("[KooboneDownload] HEAD request failed: " .. tostring(result1))
         return nil
     end
 
-    local code = result
+    local code = result2
     if type(code) ~= "number" or code < 200 or code >= 300 then
         Log.warn("[KooboneDownload] HEAD request returned HTTP " .. tostring(code))
         return nil
     end
 
-    -- 从响应头中提取 Content-Length
-    local content_length = response_headers["content-length"]
+    local resp_headers = result3 or response_headers
+    -- 从响应头中提取 Content-Length（大小写不敏感）
+    local content_length = nil
+    for k, v in pairs(resp_headers or {}) do
+        if tostring(k):lower() == "content-length" then
+            content_length = v
+            break
+        end
+    end
     if content_length then
         local size = tonumber(content_length)
         if size and size > 0 then
-            Log.info("[KooboneDownload] HEAD request got Content-Length: " .. size)
+            Log.info("[KooboneDownload] HEAD got Content-Length: " .. size)
             return size
         end
     end
@@ -624,9 +765,7 @@ function Download:_download_epub_file_with_progress(vol, file_url, expected_size
     end
 
     local tmp_path = epub_path .. ".downloading"
-    if H.file_exists(tmp_path) then
-        pcall(os.remove, tmp_path)
-    end
+    -- 优化: 不再无条件删除 tmp 文件，保留用于断点续传
 
     -- 检查取消
     if cancel_check and cancel_check() then
@@ -656,16 +795,23 @@ function Download:_download_epub_file_with_progress(vol, file_url, expected_size
     local strat_names = {}
     for _, s in ipairs(strategies) do table.insert(strat_names, s.name) end
     Log.info("[KooboneDownload] 策略列表: " .. table.concat(strat_names, ", ") .. " fmd=" .. fmd)
+    local prev_strat_url = nil
     for si, strat in ipairs(strategies) do
         Log.info("[KooboneDownload] 使用策略 " .. strat.name .. " (第" .. si .. "/" .. #strategies .. "个) verify=" .. tostring(strat.verify))
+        -- 优化: 切换策略(URL变化)时删除 tmp 文件重新开始，同一策略重试则保留断点
+        if prev_strat_url and prev_strat_url ~= strat.url then
+            if H.file_exists(tmp_path) then
+                Log.info("[KooboneDownload] 切换策略(URL变化)，删除旧断点文件重新下载")
+                pcall(os.remove, tmp_path)
+            end
+        end
+        prev_strat_url = strat.url
+
         -- 检查取消
         if cancel_check and cancel_check() then
-            Log.info("[KooboneDownload] 下载被取消，跳过后续策略")
+            Log.info("[KooboneDownload] 下载被取消，跳过后续策略（保留断点文件）")
             if progress_callback then
                 progress_callback(0, expected_size, "cancelled", "下载已取消")
-            end
-            if H.file_exists(tmp_path) then
-                pcall(os.remove, tmp_path)
             end
             return nil, "下载已取消"
         end
@@ -673,22 +819,21 @@ function Download:_download_epub_file_with_progress(vol, file_url, expected_size
         for attempt = 1, 3 do
             -- 再次检查取消
             if cancel_check and cancel_check() then
-                Log.info("[KooboneDownload] 下载被取消(尝试" .. attempt .. ")")
+                Log.info("[KooboneDownload] 下载被取消(尝试" .. attempt .. ")（保留断点文件）")
                 if progress_callback then
                     progress_callback(0, expected_size, "cancelled", "下载已取消")
-                end
-                if H.file_exists(tmp_path) then
-                    pcall(os.remove, tmp_path)
                 end
                 return nil, "下载已取消"
             end
 
-            if H.file_exists(tmp_path) then
-                pcall(os.remove, tmp_path)
-            end
-
+            -- 优化: 同一策略重试时不删除 tmp 文件，利用断点续传
             if progress_callback then
-                progress_callback(0, expected_size, "downloading", "下载策略:" .. strat.name .. " 尝试" .. attempt .. "/3")
+                local exist_bytes = self:_file_size(tmp_path)
+                if exist_bytes > 0 then
+                    progress_callback(exist_bytes, expected_size, "resume", "断点续传尝试 " .. attempt .. "/3")
+                else
+                    progress_callback(0, expected_size, "downloading", "下载策略:" .. strat.name .. " 尝试" .. attempt .. "/3")
+                end
             end
 
             -- 带进度的 HTTP 下载（使用 pcall 防止异常中断策略循环）
@@ -820,6 +965,21 @@ function Download:_extract_zip_library(epub_path, extract_dir)
     end
 end
 
+-- Lua 5.1 兼容的 os.execute 成功判断：
+-- Lua 5.1: 返回 number（0=成功，非0=失败），某些实现（如 Windows）可能返回 boolean
+-- Lua 5.2+: 返回 (true, "exit", code) 或 (nil, "signal", signo)
+local function _os_execute_ok(...)
+    local n = select("#", ...)
+    if n >= 2 then
+        -- Lua 5.2+: 第二个值是原因字符串 "exit" / "signal"
+        local _, reason = ...
+        return reason == "exit" and select(3, ...) == 0
+    end
+    -- Lua 5.1: 单返回值（number 0 或 boolean true 都表示成功）
+    local r = select(1, ...)
+    return r == 0 or r == true
+end
+
 function Download:_extract_zip_shell(epub_path, extract_dir)
     local epub_norm = epub_path:gsub("\\", "/")
     local extract_norm = extract_dir:gsub("\\", "/")
@@ -829,8 +989,7 @@ function Download:_extract_zip_shell(epub_path, extract_dir)
     else
         cmd = string.format('unzip -o -q "%s" -d "%s" 2>/dev/null', epub_norm, extract_norm)
     end
-    local ok = os.execute(cmd)
-    if ok == 0 or ok == true then
+    if _os_execute_ok(os.execute(cmd)) then
         return true
     end
     return false
@@ -1085,7 +1244,7 @@ function Download:_parse_epub_pages(epub_path, extract_dir, expected_file_md5, e
     return pages, nil
 end
 
-function Download:ensure_epub(fmd_or_vol, progress_callback)
+function Download:ensure_epub(fmd_or_vol, progress_callback, ipc_opts)
     local vol
     local fmd_str
     if type(fmd_or_vol) == "string" then
@@ -1100,6 +1259,10 @@ function Download:ensure_epub(fmd_or_vol, progress_callback)
         return nil, nil, nil, "参数错误: 需要 fmd(string) 或 vol(table)"
     end
 
+    ipc_opts = ipc_opts or {}
+    local progress_file = ipc_opts.progress_file
+    local cancel_file = ipc_opts.cancel_file
+
     -- 修复1: 重复下载保护 - 同一卷正在下载时返回 in_progress
     local key = self:_cache_key(fmd_str, vol and vol.file_md5 or nil)
     if self._active_downloads[key] then
@@ -1107,11 +1270,28 @@ function Download:ensure_epub(fmd_or_vol, progress_callback)
         if progress_callback then
             progress_callback("prepare", 0, "该卷正在下载中，请稍候...")
         end
-        -- 等待已有下载完成
+        if progress_file then
+            ipc_write_progress(progress_file, {
+                current = 0, total = 0, stage = "prepare",
+                message = "该卷正在下载中，请稍候...",
+                vol_name = tostring((vol and (vol.title or vol.vol_name)) or fmd_str),
+            })
+        end
+        -- 等待已有下载完成（使用 socket.sleep 替代 os.execute("sleep")，避免 fork shell）
+        local ok_socket_wait, socket_wait = pcall(require, "socket")
         local wait_start = os.clock()
         local timeout = 300 -- 5 分钟超时
         while self._active_downloads[key] and (os.clock() - wait_start) < timeout do
-            os.execute("sleep 0.5")
+            if cancel_file and ipc_check_cancel(cancel_file) then
+                return nil, nil, nil, "下载已取消"
+            end
+            if ok_socket_wait and socket_wait then
+                socket_wait.sleep(0.5)
+            else
+                -- 退化: 无 socket 模块时用 busy-wait（子进程中可接受）
+                local t0 = os.clock()
+                while os.clock() - t0 < 0.5 do end
+            end
         end
         if self._active_downloads[key] then
             return nil, nil, nil, "下载超时"
@@ -1150,10 +1330,12 @@ function Download:ensure_epub(fmd_or_vol, progress_callback)
     end
 
     -- ===== 创建下载进度对话框 =====
+    -- 子进程模式（progress_file 已设置）下不创建对话框，通过文件 IPC 传递进度
     local progress_dialog = nil
     local cancelled = false
-    if ok_DLProgress and DownloadProgress then
-        local vol_title = (vol and (vol.title or vol.vol_name)) or fmd_str
+    local vol_title_ipc = (vol and (vol.title or vol.vol_name)) or fmd_str
+    if not progress_file and ok_DLProgress and DownloadProgress then
+        local vol_title = vol_title_ipc
         progress_dialog = DownloadProgress:new{
             title = _("下载中"),
             on_cancel = function()
@@ -1174,14 +1356,14 @@ function Download:ensure_epub(fmd_or_vol, progress_callback)
         }
     end
 
-    -- 桥接进度回调：同时驱动外部 callback 和对话框
+    -- 桥接进度回调：同时驱动外部 callback、对话框和文件 IPC
     local function bridge_progress(stage, percent_or_bytes, msg, expected_size, download_bytes)
         if progress_dialog then
             local state = {
                 stage = stage,
                 percent = percent_or_bytes,
                 message = msg or "",
-                vol_name = (vol and (vol.title or vol.vol_name)) or fmd_str,
+                vol_name = vol_title_ipc,
             }
             if download_bytes and download_bytes > 0 then
                 state.download_bytes = download_bytes
@@ -1191,25 +1373,45 @@ function Download:ensure_epub(fmd_or_vol, progress_callback)
             end
             progress_dialog:setState(state)
         end
+        -- 子进程→父进程进度 IPC
+        if progress_file then
+            ipc_write_progress(progress_file, {
+                current = download_bytes or 0,
+                total = expected_size or 0,
+                stage = stage,
+                message = msg or "",
+                vol_name = vol_title_ipc,
+            })
+        end
         if progress_callback then
             progress_callback(stage, percent_or_bytes, msg, expected_size, download_bytes)
         end
     end
 
     local function finish_dialog(success, err_msg)
+        -- 写入最终状态到 IPC 文件
+        if progress_file then
+            ipc_write_progress(progress_file, {
+                current = success and 1 or 0,
+                total = 1,
+                stage = success and "done" or (cancelled and "cancelled" or "error"),
+                message = success and _("下载完成") or (err_msg or _("下载失败")),
+                vol_name = vol_title_ipc,
+            })
+        end
         if progress_dialog then
             if success then
                 progress_dialog:setState{
                     stage = "done",
                     percent = 100,
-                    vol_name = (vol and (vol.title or vol.vol_name)) or fmd_str,
+                    vol_name = vol_title_ipc,
                     message = _("下载完成"),
                 }
             else
                 progress_dialog:setState{
                     stage = cancelled and "cancelled" or "error",
                     percent = 0,
-                    vol_name = (vol and (vol.title or vol.vol_name)) or fmd_str,
+                    vol_name = vol_title_ipc,
                     message = err_msg or _("下载失败"),
                 }
             end
@@ -1228,7 +1430,16 @@ function Download:ensure_epub(fmd_or_vol, progress_callback)
     self:_lru_cleanup()
 
     if not vol or not vol.file_url or vol.file_url == "" then
-        if self.client then
+        -- 优化: 优先从 bookshelf 本地缓存查（避免重复拉取 vol_list）
+        if not vol and self.bookshelf then
+            local local_vol = self.bookshelf:get_vol_by_fmd(fmd_str)
+            if local_vol and local_vol.file_url and local_vol.file_url ~= "" then
+                Log.info("[KooboneDownload] bookshelf 本地命中 vol: " .. fmd_str)
+                vol = local_vol
+            end
+        end
+        -- 本地没有或缺少 file_url，才走 HTTP 查询
+        if (not vol or not vol.file_url or vol.file_url == "") and self.client then
             _state.setDownloadTask({ book_id = fmd_str, title = "查询卷信息", current = 0, total = 0 })
             bridge_progress("prepare", 5, "查询卷信息中...")
             local v, qerr = self.client:query_vol_info(fmd_str)
@@ -1239,7 +1450,7 @@ function Download:ensure_epub(fmd_or_vol, progress_callback)
                 return nil, nil, nil, "查询卷信息失败: " .. tostring(qerr or "未知")
             end
             vol = v
-        else
+        elseif not vol then
             _state.clearDownloadTask()
             cleanup_download()
             finish_dialog(false, "缺少卷信息且 client 不可用")
@@ -1265,17 +1476,29 @@ function Download:ensure_epub(fmd_or_vol, progress_callback)
         total = file_size,
     })
 
-    bridge_progress("download", 10, vol_title, file_size, 0)
+    bridge_progress("download", 0, vol_title, file_size, 0)
+
+    -- 统一取消检查（对话框 on_cancel 或 IPC cancel_file）
+    local function is_cancelled()
+        return cancelled or (cancel_file and ipc_check_cancel(cancel_file))
+    end
 
     -- 检查是否已取消
-    if cancelled then
+    if is_cancelled() then
         _state.clearDownloadTask()
         cleanup_download()
         finish_dialog(false, _("下载已取消"))
         return nil, nil, nil, _("下载已取消")
     end
 
-    local epub_path, dl_err = self:_download_epub_file(vol, vol.file_url, file_size, file_md5)
+    -- 使用带进度的下载方法，实时回调进度（含 IPC 写入）
+    local epub_path, dl_err = self:_download_epub_file_with_progress(
+        vol, vol.file_url, file_size, file_md5,
+        function(current, total, stage, message)
+            bridge_progress("downloading", 0, message or "下载中", total, current)
+        end,
+        is_cancelled
+    )
     if dl_err or not epub_path then
         _state.clearDownloadTask()
         cleanup_download()
@@ -1287,7 +1510,7 @@ function Download:ensure_epub(fmd_or_vol, progress_callback)
     _state.updateDownloadProgress(0, 0, "解析 EPUB 中...")
 
     -- 再次检查取消
-    if cancelled then
+    if is_cancelled() then
         _state.clearDownloadTask()
         cleanup_download()
         finish_dialog(false, _("下载已取消"))
@@ -1331,11 +1554,14 @@ end
 
 --- 只下载 EPUB 文件，不解压（用于 KOReader 直接打开）
 -- @param vol 卷信息表（需包含 file_url, file_md5, file_size）
--- @param progress_dialog 进度对话框（可选）
+-- @param progress_dialog 进度对话框（可选，仅在同步模式生效）
 -- @param plugin_ref 插件引用（用于检查取消状态）
+-- @param ipc_opts 进度 IPC 选项（子进程模式）：
+--   { progress_file = "...", cancel_file = "..." }
+--   子进程模式下通过文件传递进度和取消信号给父进程
 -- @return epub_path 下载后的 EPUB 文件路径，失败返回 nil
 -- @return err 错误信息
-function Download:download_epub_file(vol, progress_dialog, plugin_ref)
+function Download:download_epub_file(vol, progress_dialog, plugin_ref, ipc_opts)
     if not vol then
         return nil, "参数错误: vol 为空"
     end
@@ -1344,6 +1570,10 @@ function Download:download_epub_file(vol, progress_dialog, plugin_ref)
     if fmd == "" then
         return nil, "参数错误: 缺少 file_md5"
     end
+
+    ipc_opts = ipc_opts or {}
+    local progress_file = ipc_opts.progress_file
+    local cancel_file = ipc_opts.cancel_file
 
     -- 原子性检查1: 是否已下载（避免重复下载已完成的卷）
     local epub_path = self:_epub_path(fmd, vol.file_md5)
@@ -1387,8 +1617,17 @@ function Download:download_epub_file(vol, progress_dialog, plugin_ref)
     -- 检查是否有下载链接
     local file_url = vol.file_url
     if not file_url or file_url == "" then
-        -- 尝试从 client 查询
-        if self.client then
+        -- 优化: 优先从 bookshelf 本地缓存查（避免重复拉取 vol_list）
+        if self.bookshelf then
+            local local_vol = self.bookshelf:get_vol_by_fmd(fmd)
+            if local_vol and local_vol.file_url and local_vol.file_url ~= "" then
+                Log.info("[KooboneDownload] bookshelf 本地命中 vol(download_epub_file): " .. fmd)
+                vol = local_vol
+                file_url = vol.file_url
+            end
+        end
+        -- 本地没有，才走 HTTP 查询
+        if (not file_url or file_url == "") and self.client then
             local v, qerr = self.client:query_vol_info(fmd)
             if qerr or not v then
                 self._active_downloads[fmd] = nil
@@ -1405,16 +1644,28 @@ function Download:download_epub_file(vol, progress_dialog, plugin_ref)
 
     local file_md5 = vol.file_md5 or fmd
     local file_size = tonumber(vol.file_size) or 0
+    local vol_title_str = tostring(vol.title or vol.vol_name or fmd:sub(1, 8))
 
     -- 进度回调函数
-    -- 注意: 不传 percent 字段，让 setState 根据 download_bytes/expected_size 自己计算
-    -- 否则 setState 会误判 percent 为字节数，导致进度条始终显示 0%
+    -- 子进程模式下通过文件 IPC 传递进度给父进程（progress_dialog 在子进程中是 fork 副本，无法更新父进程 UI）
+    -- 同步模式下直接更新 progress_dialog
     local function update_progress(current, total, stage, message)
+        -- 子进程→父进程进度 IPC
+        if progress_file then
+            ipc_write_progress(progress_file, {
+                current = current,
+                total = total,
+                stage = stage,
+                message = message,
+                vol_name = vol_title_str,
+            })
+        end
+        -- 同步模式直接更新对话框（子进程模式下此调用作用于 fork 副本，不影响父进程）
         if progress_dialog and plugin_ref and not plugin_ref._download_cancelled then
             if stage then
                 progress_dialog:setState{
                     stage = stage,
-                    vol_name = tostring(vol.title or fmd),
+                    vol_name = vol_title_str,
                     download_bytes = current,
                     expected_size = total,
                     message = message,
@@ -1423,8 +1674,11 @@ function Download:download_epub_file(vol, progress_dialog, plugin_ref)
         end
     end
 
-    -- 检查是否取消
+    -- 检查是否取消（子进程通过文件 IPC 接收父进程的取消信号）
     local function check_cancelled()
+        if cancel_file and ipc_check_cancel(cancel_file) then
+            return true
+        end
         if plugin_ref and plugin_ref._download_cancelled then
             return true
         end
@@ -1717,7 +1971,18 @@ function Download:_process_queue()
                 
                 -- 如果没有 file_url，尝试查询
                 if not file_url or file_url == "" then
-                    if self.client then
+                    -- 优化: 优先从 bookshelf 本地缓存查
+                    if self.bookshelf then
+                        local local_vol = self.bookshelf:get_vol_by_fmd(fmd)
+                        if local_vol and local_vol.file_url and local_vol.file_url ~= "" then
+                            file_url = local_vol.file_url
+                            if expected_size == 0 then expected_size = tonumber(local_vol.file_size) or 0 end
+                            if file_md5 == fmd and local_vol.file_md5 then file_md5 = local_vol.file_md5 end
+                            Log.info("[KooboneDownload] 队列 bookshelf 本地命中: " .. fmd)
+                        end
+                    end
+                    -- 本地没有，才走 HTTP 查询
+                    if (not file_url or file_url == "") and self.client then
                         local v = self.client:query_vol_info(fmd)
                         if v then
                             file_url = v.file_url
@@ -1793,6 +2058,33 @@ function Download:clear_queue()
     Log.info("[KooboneDownload] 已清空下载队列: " .. count .. " 项")
     self:_notify_queue()
     return count
+end
+
+-- ===== 公开 IPC 方法（供父进程调用）=====
+
+-- 生成下载进度的 IPC 文件路径
+function Download:ipc_paths(fmd)
+    local base = self.EPUB_CACHE_DIR .. "/_ipc_" .. tostring(fmd or "unknown")
+    return {
+        progress_file = base .. "_progress.json",
+        cancel_file = base .. "_cancel.flag",
+    }
+end
+
+-- 父进程读取子进程写入的进度
+function Download:ipc_read_progress(progress_file)
+    return ipc_read_progress(progress_file)
+end
+
+-- 父进程发送取消信号
+function Download:ipc_send_cancel(cancel_file)
+    ipc_write_cancel(cancel_file)
+end
+
+-- 清理 IPC 文件
+function Download:ipc_cleanup(paths)
+    if not paths then return end
+    ipc_cleanup(paths.progress_file, paths.cancel_file)
 end
 
 return Download

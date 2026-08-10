@@ -7,9 +7,9 @@ return {
     account = "your_email@example.com",
     password = "your_password",
 
-    -- 网站地址（可选，默认 www.koobone.com）
-    -- 走本地 kindle-forge 后端时填 "127.0.0.1:5001"（会走 http）
-    base_host = "www.koobone.com",
+    -- 网站地址（可选，默认 whttps://koobone.com）
+    
+    base_host = "https://koobone.com",
 
     -- 若已手动抓包获取了 Cookie，可直接填这里跳过账号密码登录
     -- 格式："VLIBSID=xxxxx; KBSKEY=yyyyy"

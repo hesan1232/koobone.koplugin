@@ -179,9 +179,34 @@ function Bookshelf:get_series_list()
             })
         end
     end
-    table.sort(result, function(a, b)
-        return (a.last_update_time or 0) > (b.last_update_time or 0)
-    end)
+    -- 根据用户保存的排序偏好对系列列表排序
+    local sort_key = self.settings:get_shelf_sort()
+    if sort_key == "vol_name" then
+        table.sort(result, function(a, b)
+            return (a.title or "") < (b.title or "")
+        end)
+    elseif sort_key == "last_read" then
+        -- 按最后阅读时间排序：取系列内最大的 _local_last_read
+        for _, s in ipairs(result) do
+            local max_read = 0
+            for _, v in ipairs(s.vols or {}) do
+                local lr = v._local_last_read or 0
+                if lr > max_read then max_read = lr end
+            end
+            s._max_last_read = max_read
+        end
+        table.sort(result, function(a, b)
+            local ta = a._max_last_read or 0
+            local tb = b._max_last_read or 0
+            if ta ~= tb then return ta > tb end
+            return (a.last_update_time or 0) > (b.last_update_time or 0)
+        end)
+    else
+        -- "uptime" 或默认: 按更新时间降序
+        table.sort(result, function(a, b)
+            return (a.last_update_time or 0) > (b.last_update_time or 0)
+        end)
+    end
     return result
 end
 
@@ -202,35 +227,38 @@ function Bookshelf:get_series_vols(series_id)
             end
         end
     end
-    table.sort(vols, function(a, b)
-        local sa = a.vol_snumber or 0
-        local sb = b.vol_snumber or 0
-        if sa ~= sb and sa > 0 and sb > 0 then
-            return sa < sb
-        end
-        return (a.update_time or 0) < (b.update_time or 0)
-    end)
+    -- 根据用户保存的排序偏好排序（之前硬编码为 vol_snumber，导致排序不生效）
+    local sort_key = self.settings:get_shelf_sort()
+    if sort_key == "vol_name" then
+        table.sort(vols, function(a, b)
+            return (a.title or "") < (b.title or "")
+        end)
+    elseif sort_key == "last_read" then
+        table.sort(vols, function(a, b)
+            local ta = a._local_last_read or 0
+            local tb = b._local_last_read or 0
+            if ta ~= tb then return ta > tb end
+            -- fallback: 卷序号
+            return (a.vol_snumber or 0) < (b.vol_snumber or 0)
+        end)
+    else
+        -- "uptime" 或默认: 按更新时间降序（最新在前），卷序号作为次级排序
+        table.sort(vols, function(a, b)
+            local sa = a.vol_snumber or 0
+            local sb = b.vol_snumber or 0
+            if sa ~= sb and sa > 0 and sb > 0 then
+                return sa < sb
+            end
+            return (a.update_time or 0) > (b.update_time or 0)
+        end)
+    end
     return vols
 end
 
 function Bookshelf:sort_vols(sort_key)
+    -- 仅持久化排序偏好；实际排序在 get_series_list / get_series_vols 中
+    -- 基于 settings:get_shelf_sort() 动态执行，无需在此重复排序 self.vols。
     sort_key = sort_key or "uptime"
-    self:ensure_loaded()
-    if sort_key == "uptime" then
-        table.sort(self.vols, function(a, b)
-            return (a.update_time or 0) > (b.update_time or 0)
-        end)
-    elseif sort_key == "vol_name" then
-        table.sort(self.vols, function(a, b)
-            return (a.title or "") < (b.title or "")
-        end)
-    elseif sort_key == "last_read" then
-        table.sort(self.vols, function(a, b)
-            local ta = a._local_last_read or 0
-            local tb = b._local_last_read or 0
-            return ta > tb
-        end)
-    end
     self.settings:set_shelf_sort(sort_key)
     self.settings:flush()
     self.dirty = true

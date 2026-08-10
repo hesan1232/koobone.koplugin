@@ -3,7 +3,6 @@ local M = {
     current_page = 0,
     shelf_vols_cache = nil,
     shelf_cache_ttl = 30,
-    current_shelf_sort = "uptime",
     download_task = nil,
     progress_upload_task = nil,
     last_read_time = {},
@@ -49,16 +48,6 @@ end
 
 function M.invalidateShelfCache()
     M.shelf_vols_cache = nil
-end
-
-function M.getShelfSort()
-    return M.current_shelf_sort
-end
-
-function M.setShelfSort(sort_key)
-    if sort_key == "uptime" or sort_key == "vol_name" then
-        M.current_shelf_sort = sort_key
-    end
 end
 
 function M.setDownloadTask(t)
