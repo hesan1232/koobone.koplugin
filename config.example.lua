@@ -21,8 +21,8 @@ return {
     -- 书架默认排序："uptime" = 按更新时间，"vol_name" = 按名字
     shelf_sort = "uptime",
 
-    -- 是否下载封面图片（墨水屏建议关闭节省空间和流量）
-    download_covers = false,
+    -- 是否下载封面图片（墨水屏可关闭以节省空间和流量，默认开启）
+    download_covers = true,
 
     -- 缓存 EPUB 的最大体积（MB），超过会自动清理最久未访问的
     cache_max_size_mb = 1024,

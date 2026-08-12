@@ -1,6 +1,7 @@
 local ltn12 = require("ltn12")
 local H = require("koobone.helper")
 local Log = require("koobone.logger")
+local Koobone = require("koobone.koobone")
 
 local ok_https, https = pcall(require, "ssl.https")
 local ok_http, http = pcall(require, "socket.http")
@@ -20,16 +21,20 @@ end
 
 local DEFAULT_TIMEOUT = 15
 local DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-local SHELF_CACHE_TTL = 30
+local SHELF_CACHE_TTL = 300  -- 5分钟（与 fanqie 一致，避免重复发起网络请求）
 
 local Client = {}
 Client.__index = Client
 
-local VOL_LIST_CACHE = {
+-- L1 短缓存：vol_list（全局不带 sid）+ 按系列的 vol_list（带 sid）
+-- 两级缓存，避免每次进目录都发 HTTP
+local VOL_LIST_CACHE_GLOBAL = {
     ts = 0,
     sort = nil,
     data = nil,
 }
+-- key = series_id, value = { ts, data }
+local VOL_LIST_CACHE_BY_SERIES = {}
 
 local function header_value(headers, name)
     if not headers then
@@ -93,6 +98,15 @@ function Client:new(settings)
     return obj
 end
 
+-- L1: 清理 API 层短缓存（force_refresh / 主动清缓存时调用）
+function Client:clearVolListCache()
+    VOL_LIST_CACHE_GLOBAL.ts = 0
+    VOL_LIST_CACHE_GLOBAL.sort = nil
+    VOL_LIST_CACHE_GLOBAL.data = nil
+    VOL_LIST_CACHE_BY_SERIES = {}
+    Log.debug("[Koobone] clearVolListCache: 全局+按系列 L1 API短缓存已清空")
+end
+
 function Client:json_encode(data)
     if not ok_json then
         error("JSON module is not available")
@@ -114,27 +128,26 @@ function Client:json_decode(text)
 end
 
 function Client:_build_base_url()
-    local raw_host = self.settings:get_base_host() or "www.koobone.com"
-    
-    -- 修复: 正确处理带协议前缀的 host（如 "https://koobone.com"）
+    local raw_host = self.settings:get_base_host() or Koobone.DEFAULT_HOST
+    local base = Koobone.normalize_base(raw_host)
+
+    local scheme_match, host_match = base:match("^(https?)://(.+)$")
     local scheme, host
-    local scheme_match, host_match = raw_host:match("^(https?)://(.+)$")
     if scheme_match and host_match then
         scheme = scheme_match
         host = host_match
     else
-        host = raw_host
-        local is_local = host:find("127%.0%.0%.1") or host:find("localhost")
-        scheme = is_local and "http" or "https"
+        host = base
+        scheme = Koobone.is_local_host(base) and "http" or "https"
     end
-    
+
     -- 移除可能的端口号用于本地判断
     local host_only = host:gsub(":%d+$", "")
     local is_local = host_only == "127.0.0.1" or host_only == "localhost"
     if is_local then
         scheme = "http"
     end
-    
+
     return scheme .. "://" .. host, scheme, host
 end
 
@@ -158,7 +171,7 @@ function Client:request(opts)
             base_host = host_match
         else
             scheme = "https"
-            base_host = "www.koobone.com"
+            base_host = Koobone.DEFAULT_HOST
         end
     else
         local base_url
@@ -223,6 +236,75 @@ function Client:request(opts)
         return body_text, tonumber(code), resp_headers or {}, status
     end
     return body_text, tonumber(code), resp_headers or {}, status
+end
+
+-- 拉取二进制数据（图片/封面等小文件）
+-- 参考 fanqie client:get_binary：返回原始 body 字符串（可能是二进制），不处理 JSON
+-- 用于封面下载（图片 URL 可能是 CDN 域名 img.koobone.com，不是主站 koobone.com）
+function Client:get_binary(url, opts)
+    opts = opts or {}
+    local timeout = opts.timeout or 30
+
+    local scheme_match = url:match("^(https?)://")
+    local transport = (scheme_match == "https") and https or http
+    if scheme_match == "https" and not ok_https then
+        error("get_binary: ssl.https is not available (url=" .. tostring(url) .. ")")
+    end
+    if not transport then
+        error("get_binary: no HTTP transport available (url=" .. tostring(url) .. ")")
+    end
+
+    local scheme_host = url:match("^(https?://[^/]+)") or ""
+    local cookie = self.settings:get_cookie()
+
+    -- CDN 图片请求：严格按照用户提供的成功 curl 命令构建 headers：
+    --   1. 必须带登录 Cookie (KBSKEY/VLIBSID 等) — 防盗链靠 Cookie，不是 Referer
+    --   2. 不带 Referer (curl 里 sec-fetch-site: none → 直接导航无来源)
+    --   3. Accept 用浏览器标准格式 (包含 text/html)，不是纯 image/*
+    --   4. User-Agent 保持桌面浏览器
+    -- 如果调用方显式传了 opts.referer / opts.headers 则以调用方为准。
+    local headers = {
+        ["User-Agent"] = DESKTOP_UA,
+        ["Accept"] = opts.accept or "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        ["Accept-Language"] = opts.accept_language or "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+        ["Accept-Encoding"] = "identity",
+        ["Cache-Control"] = "max-age=0",
+        ["Upgrade-Insecure-Requests"] = "1",
+        ["Connection"] = "keep-alive",
+    }
+    if opts.referer then
+        headers["Referer"] = opts.referer
+    end
+    if cookie and cookie ~= "" then
+        headers["Cookie"] = cookie
+    end
+    if opts.headers then
+        for k, v in pairs(opts.headers) do
+            headers[k] = v
+        end
+    end
+
+    local response = {}
+    local request_options = {
+        url = url,
+        method = "GET",
+        headers = headers,
+        sink = ltn12.sink.table(response),
+    }
+    -- SSL bypass（和 EPUB/HttpDL 一致：Kindle 旧 CA 无法验证 img.koobone.com 证书）
+    if scheme_match == "https" then
+        request_options.mode = "client"
+        request_options.protocol = "tlsv1_2"
+        request_options.verify = "none"
+        request_options.options = "all"
+    end
+
+    local _, code, _ = transport_request(transport, request_options, timeout)
+    local data = table.concat(response)
+    if type(code) ~= "number" or code < 200 or code >= 300 then
+        error(string.format("get_binary: HTTP %s url=%s", tostring(code), tostring(url)))
+    end
+    return data, tonumber(code)
 end
 
 function Client:is_auth_error(code, body_text)
@@ -354,18 +436,45 @@ local function extract_vol_array(resp_data)
     return {}
 end
 
+-- params: sort, limit, page, sid(系列id), sna(系列名)
+-- fanqie 对齐模式：
+--   书架 → client:get_series_list() → series_list.php（全局系列）
+--   目录 → client:get_vol_list{ sid=series_id, sna=series_title } → vol_list.php?sid=&sna=（该系列卷）
 function Client:get_vol_list(params)
     params = params or {}
     local sort = params.sort or "uptime"
     local limit = params.limit or 200
     local page = params.page or 1
+    local sid = params.sid and tostring(params.sid) or ""
+    local sna = params.sna and tostring(params.sna) or ""
+    local force = params.force and true or false
+    -- 按系列查询：sid 或 sna 有值就算（seriesid 为空的系列只靠 sna 查）
+    local by_series = sid ~= "" or sna ~= ""
+    -- 缓存 key：sid 非空用 sid，否则用 sna
+    local series_cache_key = sid ~= "" and sid or sna
 
     local now = os.time()
-    if VOL_LIST_CACHE.data
-        and (now - VOL_LIST_CACHE.ts) < SHELF_CACHE_TTL
-        and VOL_LIST_CACHE.sort == sort then
-        Log.debug("[Koobone] get_vol_list 使用缓存 (", VOL_LIST_CACHE.ts, " age=", now - VOL_LIST_CACHE.ts, "s)")
-        return VOL_LIST_CACHE.data
+
+    -- force=true：强制绕过 L1 短缓存（用户主动刷新）
+    if not force then
+        -- 按系列查询（目录）：独立缓存
+        if by_series then
+            local cache = VOL_LIST_CACHE_BY_SERIES[series_cache_key]
+            if cache
+                and (now - cache.ts) < SHELF_CACHE_TTL
+                and cache.sort == sort then
+                Log.debug("[Koobone] get_vol_list(series) 命中缓存 key=", series_cache_key, " age=", now - cache.ts, "s")
+                return cache.data
+            end
+        else
+            -- 全局查询：原 VOL_LIST_CACHE_GLOBAL
+            if VOL_LIST_CACHE_GLOBAL.data
+                and (now - VOL_LIST_CACHE_GLOBAL.ts) < SHELF_CACHE_TTL
+                and VOL_LIST_CACHE_GLOBAL.sort == sort then
+                Log.debug("[Koobone] get_vol_list(global) 命中缓存 age=", now - VOL_LIST_CACHE_GLOBAL.ts, "s")
+                return VOL_LIST_CACHE_GLOBAL.data
+            end
+        end
     end
 
     local uin = self.settings:get_uin()
@@ -377,7 +486,9 @@ function Client:get_vol_list(params)
         error("获取卷列表失败: 无法获取 uin")
     end
 
-    Log.info("[Koobone] get_vol_list: sort=" .. sort .. ", limit=" .. limit .. ", uin=" .. tostring(uin))
+    Log.info("[Koobone] get_vol_list: sort=" .. sort .. ", limit=" .. limit
+        .. ", uin=" .. tostring(uin)
+        .. (by_series and (", sid=" .. sid .. ", sna=" .. sna) or ", global"))
 
     local all_vols = {}
     local current_page = page
@@ -388,8 +499,15 @@ function Client:get_vol_list(params)
             .. "&by=" .. H.url_encode(sort)
             .. "&limit=" .. H.url_encode(tostring(limit))
             .. "&page=" .. H.url_encode(tostring(current_page))
+        if by_series then
+            -- 与 curl 示例对齐：sid=KMOE:xxx，sna=URL编码的系列名
+            if sna ~= "" then
+                query = query .. "&sna=" .. H.url_encode(sna)
+            end
+            query = query .. "&sid=" .. H.url_encode(sid)
+        end
 
-        Log.debug("[Koobone] get_vol_list 拉取第", current_page, "页")
+        Log.debug("[Koobone] get_vol_list 拉取第", current_page, "页 query=", query)
 
         local text, code = self:request({
             method = "GET",
@@ -427,13 +545,36 @@ function Client:get_vol_list(params)
         current_page = current_page + 1
     end
 
-    Log.info("[Koobone] get_vol_list 完成, 共", #all_vols, "卷")
+    Log.info("[Koobone] get_vol_list 完成, 共", #all_vols, "卷", by_series and (" key=" .. series_cache_key) or " global")
 
-    VOL_LIST_CACHE.ts = now
-    VOL_LIST_CACHE.sort = sort
-    VOL_LIST_CACHE.data = all_vols
+    -- 写入缓存
+    if by_series then
+        VOL_LIST_CACHE_BY_SERIES[series_cache_key] = {
+            ts = now,
+            sort = sort,
+            data = all_vols,
+        }
+    else
+        VOL_LIST_CACHE_GLOBAL.ts = now
+        VOL_LIST_CACHE_GLOBAL.sort = sort
+        VOL_LIST_CACHE_GLOBAL.data = all_vols
+    end
 
     return all_vols
+end
+
+-- L1 短缓存：series_list（书架主数据源，5分钟 TTL）
+local SERIES_LIST_CACHE = {
+    ts = 0,
+    sort = nil,
+    data = nil,
+}
+
+function Client:clearSeriesListCache()
+    SERIES_LIST_CACHE.ts = 0
+    SERIES_LIST_CACHE.sort = nil
+    SERIES_LIST_CACHE.data = nil
+    Log.debug("[Koobone] clearSeriesListCache: L1 series_list API短缓存已清空")
 end
 
 function Client:get_series_list(params)
@@ -441,6 +582,17 @@ function Client:get_series_list(params)
     local sort = params.sort or "uptime"
     local limit = params.limit or 50
     local page = params.page or 1
+    local force = params.force and true or false
+
+    local now = os.time()
+
+    -- force=true：强制绕过 L1 短缓存（用于用户主动刷新书架）
+    if not force and SERIES_LIST_CACHE.data
+        and (now - SERIES_LIST_CACHE.ts) < SHELF_CACHE_TTL
+        and SERIES_LIST_CACHE.sort == sort then
+        Log.debug("[Koobone] get_series_list 命中缓存 age=", now - SERIES_LIST_CACHE.ts, "s")
+        return SERIES_LIST_CACHE.data
+    end
 
     local uin = self.settings:get_uin()
     if not uin or uin == "" then
@@ -465,7 +617,6 @@ function Client:get_series_list(params)
     })
 
     local series_list = {}
-    local direct_ok = false
 
     if code and code >= 200 and code < 300 then
         local ok, resp_data = pcall(function()
@@ -486,14 +637,35 @@ function Client:get_series_list(params)
             end
 
             if #raw_list > 0 then
-                direct_ok = true
                 for _, s in ipairs(raw_list) do
                     if type(s) == "table" then
+                        -- 调试日志：打印 series 原始字段名（仅第一次）
+                        if not _SERIES_DEBUGGED then
+                            _SERIES_DEBUGGED = true
+                            local keys = {}
+                            for k, _ in pairs(s) do
+                                table.insert(keys, tostring(k))
+                            end
+                            Log.debug("[Koobone] series_list 原始字段: " .. table.concat(keys, ", "))
+                            Log.debug("[Koobone] series_list 样例: seriesid=" .. tostring(s.seriesid)
+                                .. " series=" .. tostring(s.series)
+                                .. " cover_url=" .. tostring(s.cover_url)
+                                .. " seq=" .. tostring(s.seq))
+                        end
+                        -- seriesid 可能为空字符串（如"地獄樂" seriesid=""），
+                        -- 空时用系列名作为 id（书架唯一标识 + 封面文件名 + is_vol_downloaded key）
+                        -- 同时保留原始 seriesid（api_sid）供 vol_list.php 查询用
+                        local api_sid = tostring(s.seriesid or s.series_id or s.sid or "")
+                        local sid = api_sid
+                        if sid == "" then
+                            sid = tostring(s.series or s.name or s.title or s.series_name or "")
+                        end
                         table.insert(series_list, {
-                            id = tostring(s.seriesid or s.series_id or s.sid or s.id or s.seq or ""),
+                            id = sid,
+                            api_sid = api_sid,
                             title = tostring(s.series or s.name or s.title or s.series_name or ""),
                             author = tostring(s.author or s.writer or ""),
-                            cover_url = tostring(s.cover_url or s.cover or s.thumb or s.thumbnail or ""),
+                            cover_url = tostring(s.cover_url or s.cover or s.thumb or ""),
                             status = tostring(s.status or s.state or ""),
                             progress = tonumber(s.progress or s.read_progress) or 0,
                             comic_count = tonumber(s.count_vol or s.vol_count or s.vols or s.count) or 0,
@@ -507,40 +679,13 @@ function Client:get_series_list(params)
         end
     end
 
-    if not direct_ok or #series_list == 0 then
-        Log.info("[Koobone] get_series_list 直接接口为空，从 vol_list 按 series 聚合构建")
-        local vols = self:get_vol_list({ sort = sort, limit = 200 })
-        local series_map = {}
-        local order = {}
-        for _, vol in ipairs(vols) do
-            local sid = vol.series_id or vol.series
-            if sid and sid ~= "" then
-                if not series_map[sid] then
-                    series_map[sid] = {
-                        id = vol.series_id or "",
-                        title = vol.series or "",
-                        author = vol.author or "",
-                        cover_url = vol.cover_url or "",
-                        comic_count = 0,
-                        update_time = 0,
-                        _raw = nil,
-                    }
-                    table.insert(order, sid)
-                end
-                series_map[sid].comic_count = series_map[sid].comic_count + 1
-                if vol.update_time > series_map[sid].update_time then
-                    series_map[sid].update_time = vol.update_time
-                    series_map[sid].cover_url = vol.cover_url or series_map[sid].cover_url
-                    series_map[sid].author = vol.author or series_map[sid].author
-                end
-            end
-        end
-        for _, sid in ipairs(order) do
-            table.insert(series_list, series_map[sid])
-        end
-    end
-
     Log.info("[Koobone] get_series_list 完成, 共", #series_list, "系列")
+
+    -- 写入 L1 缓存（即使为空也写入，避免空值连续打 API）
+    SERIES_LIST_CACHE.ts = now
+    SERIES_LIST_CACHE.sort = sort
+    SERIES_LIST_CACHE.data = series_list
+
     return series_list
 end
 

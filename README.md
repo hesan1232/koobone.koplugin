@@ -51,7 +51,7 @@ KOReader 菜单 → 插件 → Koobone 漫画 → 打开书架
 
 | 配置项 | 说明 |
 |--------|------|
-| **服务器地址** | Koobone API 地址（如 `www.koobone.com`） |
+| **服务器地址** | Koobone API 地址（默认 `https://koobone.com`） |
 | **登录 Cookie** | 手动设置登录 Cookie（VLIBSID + KBSKEY） |
 | **排序方式** | 书架默认排序：更新时间 / 名称 / 最后阅读 |
 | **预下载卷数** | 打开漫画后自动预下载的后续卷数 |

@@ -143,6 +143,10 @@ function DownloadProgress:init()
 end
 
 function DownloadProgress:_redraw()
+    -- 关键修复：弹窗关闭后不再触发 setDirty，防止局刷
+    -- _visible/_closed 在 shelf_view.show_download_progress 中正确设置
+    if self._closed then return end
+    if self._visible == false then return end
     local target = (self.frame and self.frame.dimen) or self.dimen
     UIManager:setDirty(self, function()
         return "fast", target
@@ -150,6 +154,11 @@ function DownloadProgress:_redraw()
 end
 
 function DownloadProgress:setState(state)
+    -- 关键修复：弹窗关闭后不再更新 UI，直接返回
+    -- _visible/_closed 在 shelf_view.show_download_progress 中正确设置
+    if self._closed then return end
+    if self._visible == false then return end
+
     state = state or {}
     local current = tonumber(state.current) or 0
     local total = tonumber(state.total) or 0
@@ -202,9 +211,21 @@ function DownloadProgress:setState(state)
     end
     local percent_text = tostring(math.floor(percent * 100 + 0.5)) .. "%"
     local status_text = table.concat(rows, "\n")
+
+    -- 使用签名防抖：只有内容真正变化时才更新 UI，减少局刷
     local signature = percent_text .. "\n" .. status_text
-    if signature == self._last_signature then return end
+    if signature == self._last_signature then
+        -- 签名未变化，跳过更新（但确保阶段变化时仍触发更新）
+        if state.stage and state.stage ~= self._last_stage then
+            self._last_stage = state.stage
+            self.progress:setPercentage(percent)
+            self:_redraw()
+        end
+        return
+    end
     self._last_signature = signature
+    self._last_stage = state.stage
+    self._last_percent = percent
     self.progress:setPercentage(percent)
     self.percent_widget:setText(percent_text)
     self.status_widget:setText(status_text)

@@ -260,4 +260,156 @@ function H.get_pages_dir()
     return H.get_cache_dir() .. "/pages"
 end
 
+-- ============================================================
+-- 路径 / URL 工具
+-- ============================================================
+
+function H.path_normalize(p)
+    if not p then return "" end
+    p = p:gsub("\\", "/")
+    local parts = {}
+    for part in p:gmatch("([^/]+)") do
+        if part == ".." then
+            if #parts > 0 then
+                table.remove(parts)
+            end
+        elseif part ~= "." and part ~= "" then
+            table.insert(parts, part)
+        end
+    end
+    local result = table.concat(parts, "/")
+    if p:sub(1, 1) == "/" then
+        result = "/" .. result
+    end
+    return result
+end
+
+function H.join_url(base, rel)
+    if not rel or rel == "" then return "" end
+    if rel:find("^%a+://") then return rel end
+    if rel:sub(1, 1) == "/" then
+        local scheme_host = base:match("^(https?://[^/]+)") or ""
+        return scheme_host .. rel
+    end
+    local base_dir = base:match("^(.*)/[^/]*$") or base
+    return H.path_normalize(base_dir .. "/" .. rel)
+end
+
+function H.read_file_text(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local data = f:read("*all")
+    f:close()
+    if not data then return nil end
+    local ok_txt, txt = pcall(function()
+        return data:gsub("\0", "")
+    end)
+    if ok_txt then return txt end
+    return data
+end
+
+-- ============================================================
+-- 文件系统工具
+-- ============================================================
+
+function H.file_mtime(path)
+    local mtime = lfs.attributes(path, "modification")
+    return mtime or 0
+end
+
+function H.safe_rmtree(dir)
+    H.delete_dir(dir)
+end
+
+function H.dir_size(dir)
+    if not H.dir_exists(dir) then return 0 end
+    local total = 0
+    for entry in lfs.dir(dir) do
+        if entry ~= "." and entry ~= ".." then
+            local full = H.join_path(dir, entry)
+            local mode = lfs.attributes(full, "mode")
+            if mode == "directory" then
+                total = total + H.dir_size(full)
+            else
+                total = total + H.file_size(full)
+            end
+        end
+    end
+    return total
+end
+
+-- ============================================================
+-- LRU 缓存清理
+-- ============================================================
+
+function H.lru_cleanup(cache_dir, opts)
+    opts = opts or {}
+    local max_age = opts.max_age or (24 * 3600)
+    local max_bytes = opts.max_bytes or (512 * 1024 * 1024)
+
+    if not H.dir_exists(cache_dir) then
+        return
+    end
+    local now_ts = os.time()
+    local entries = {}
+    local total_bytes = 0
+    local ok, err = pcall(function()
+        for name in lfs.dir(cache_dir) do
+            if name ~= "." and name ~= ".." then
+                local p = H.join_path(cache_dir, name)
+                local attr_ok, attr = pcall(function() return lfs.attributes(p) end)
+                if attr_ok and attr then
+                    local atime = attr.access or attr.modification or now_ts
+                    if now_ts - atime > max_age then
+                        local mode = attr.mode
+                        if mode == "directory" then
+                            Log.info("[KooboneCache] 清理过期目录:", name)
+                            H.safe_rmtree(p)
+                        else
+                            Log.info("[KooboneCache] 清理过期文件:", name)
+                            os.remove(p)
+                        end
+                    else
+                        local size = 0
+                        if attr.mode == "directory" then
+                            size = H.dir_size(p)
+                        else
+                            size = attr.size or 0
+                        end
+                        total_bytes = total_bytes + size
+                        table.insert(entries, { atime = atime, size = size, path = p, name = name })
+                    end
+                end
+            end
+        end
+
+        local limit_bytes = math.floor(max_bytes * 0.8)
+        if total_bytes > max_bytes then
+            table.sort(entries, function(a, b)
+                return a.atime < b.atime
+            end)
+            for _, entry in ipairs(entries) do
+                if total_bytes <= limit_bytes then
+                    break
+                end
+                local attr_ok2, attr2 = pcall(function() return lfs.attributes(entry.path) end)
+                if attr_ok2 and attr2 then
+                    local mode = attr2.mode
+                    if mode == "directory" then
+                        Log.info("[KooboneCache] 清理最旧目录(总大小超限):", entry.name)
+                        H.safe_rmtree(entry.path)
+                    else
+                        Log.info("[KooboneCache] 清理最旧文件(总大小超限):", entry.name)
+                        os.remove(entry.path)
+                    end
+                end
+                total_bytes = total_bytes - entry.size
+            end
+        end
+    end)
+    if not ok then
+        Log.warn("[KooboneCache] LRU cleanup exception:", tostring(err))
+    end
+end
+
 return H

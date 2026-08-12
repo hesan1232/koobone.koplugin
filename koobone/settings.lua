@@ -2,6 +2,7 @@ local DataStorage = require("datastorage")
 local LuaSettings = require("luasettings")
 local H = require("koobone.helper")
 local Log = require("koobone.logger")
+local Koobone = require("koobone.koobone")
 
 local Settings = {}
 Settings.__index = Settings
@@ -11,7 +12,7 @@ local defaults = {
         account = "",
         password = "",
         uin = "",
-        base_host = "www.koobone.com",
+        base_host = Koobone.DEFAULT_HOST,
         cookie_vlibsid = "",
         cookie_kbskey = "",
         auto_relogin = true,
@@ -21,7 +22,7 @@ local defaults = {
         per_page = 25,
     },
     cache = {
-        download_covers = false,
+        download_covers = true,
         cache_max_size_mb = 1024,
         lru_cleanup_enabled = true,
     },
@@ -116,7 +117,7 @@ function Settings:_merge_config()
     if (not auth.uin or auth.uin == "") and cfg.uin and cfg.uin ~= "" then
         auth.uin = cfg.uin; changed = true
     end
-    if (not auth.base_host or auth.base_host == "www.koobone.com") and cfg.base_host and cfg.base_host ~= "" then
+    if (not auth.base_host or auth.base_host == Koobone.DEFAULT_HOST) and cfg.base_host and cfg.base_host ~= "" then
         auth.base_host = cfg.base_host; changed = true
     end
     -- cookie: 从 "VLIBSID=xxx; KBSKEY=yyy" 解析
@@ -133,31 +134,33 @@ function Settings:_merge_config()
     end
     if changed then self.store:saveSetting("auth", auth) end
 
-    -- shelf 表
+    -- shelf 表: nil-only 合并（只在 store 值为空时才从 config 读取）
+    -- 修复: 之前逻辑是"config 值和 store 值不同就覆盖"，导致用户在界面中
+    -- 设置的排序每次重启都被 config.lua 的 shelf_sort 覆盖回去
     local shelf = self.store:readSetting("shelf") or deepcopy(defaults.shelf)
-    if cfg.shelf_sort and cfg.shelf_sort ~= shelf.sort_order then
+    if (not shelf.sort_order or shelf.sort_order == "") and cfg.shelf_sort then
         shelf.sort_order = cfg.shelf_sort
         self.store:saveSetting("shelf", shelf); changed = true
     end
 
-    -- cache 表
+    -- cache 表: nil-only 合并
     local cache = self.store:readSetting("cache") or deepcopy(defaults.cache)
-    if cfg.download_covers ~= nil and cache.download_covers ~= cfg.download_covers then
+    if cache.download_covers == nil and cfg.download_covers ~= nil then
         cache.download_covers = cfg.download_covers == true
         self.store:saveSetting("cache", cache); changed = true
     end
-    if cfg.cache_max_size_mb and cache.cache_max_size_mb ~= cfg.cache_max_size_mb then
+    if (not cache.cache_max_size_mb) and cfg.cache_max_size_mb then
         cache.cache_max_size_mb = cfg.cache_max_size_mb
         self.store:saveSetting("cache", cache); changed = true
     end
 
-    -- reader 表
+    -- reader 表: nil-only 合并
     local reader = self.store:readSetting("reader") or deepcopy(defaults.reader)
-    if cfg.pre_download_pages and reader.pre_download_pages ~= cfg.pre_download_pages then
+    if (not reader.pre_download_pages) and cfg.pre_download_pages then
         reader.pre_download_pages = cfg.pre_download_pages
         self.store:saveSetting("reader", reader); changed = true
     end
-    if cfg.progress_upload_interval and reader.progress_upload_interval ~= cfg.progress_upload_interval then
+    if (not reader.progress_upload_interval) and cfg.progress_upload_interval then
         reader.progress_upload_interval = cfg.progress_upload_interval
         self.store:saveSetting("reader", reader); changed = true
     end
@@ -265,12 +268,12 @@ function Settings:set_uin(v)
 end
 
 function Settings:get_base_host()
-    return self:get("auth") and self:get("auth").base_host or "www.koobone.com"
+    return self:get("auth") and self:get("auth").base_host or Koobone.DEFAULT_HOST
 end
 
 function Settings:set_base_host(v)
     local auth = self:get("auth") or {}
-    auth.base_host = v or "www.koobone.com"
+    auth.base_host = v or Koobone.DEFAULT_HOST
     self:set("auth", auth)
 end
 
@@ -317,17 +320,38 @@ function Settings:set_auto_relogin(v)
 end
 
 function Settings:get_shelf_sort()
-    return self:get("shelf") and self:get("shelf").sort_order or "uptime"
+    local shelf = self:get("shelf")
+    return (shelf and shelf.sort_order) or "last_read"
 end
 
 function Settings:set_shelf_sort(v)
     local shelf = self:get("shelf") or {}
-    shelf.sort_order = v or "uptime"
+    shelf.sort_order = v or "last_read"
     self:set("shelf", shelf)
 end
 
+-- 下载任务持久化（异常退出重启后恢复/标记中断）
+function Settings:getDownloadTask()
+    return self:get("download_task")
+end
+
+function Settings:setDownloadTask(task)
+    self:set("download_task", task)
+end
+
+-- 下载历史（最近10条）
+function Settings:getDownloadHistory()
+    return self:get("download_history")
+end
+
+function Settings:setDownloadHistory(history)
+    self:set("download_history", history)
+end
+
 function Settings:should_download_covers()
-    return self:get("cache") and self:get("cache").download_covers == true
+    local cache = self:get("cache") or {}
+    -- cache.download_covers: true=下载, false=不下载, nil=默认下载（兼容旧缓存无此字段）
+    return cache.download_covers ~= false
 end
 
 function Settings:set_download_covers(v)
@@ -367,6 +391,7 @@ function Settings:build_menu_items(plugin)
     local ok_input, InputDialog = pcall(require, "ui/widget/inputdialog")
     local ok_info, InfoMessage = pcall(require, "ui/widget/infomessage")
     local ok_confirm, ConfirmBox = pcall(require, "ui/widget/confirmbox")
+    local ok_multiinput, MultiInputDialog = pcall(require, "ui/widget/multiinputdialog")
 
     -- 修复: require("gettext") 可能加载失败导致整个 build_menu_items 抛错
     local ok_gettext, gettext = pcall(require, "gettext")
@@ -524,66 +549,88 @@ function Settings:build_menu_items(plugin)
         end
     end
 
+    -- 多字段账号对话框：账号 + 密码 + 网站地址 一次输入
+    -- 使用 KOReader 原生 MultiInputDialog，自动处理居中显示和焦点切换
+    local function account_dialog()
+        if not (ok_ui and ok_multiinput and ok_input) then
+            -- 回退：如果 MultiInputDialog 不可用，用旧的单字段方式
+            input_dialog(_("账号 (邮箱)"), _("请输入邮箱账号"), self:get_account(), false,
+                function(value)
+                    self:set_account(value); self:flush(); show_info(_("账号已保存"))
+                end)
+            return
+        end
+
+        local dialog
+        dialog = MultiInputDialog:new{
+            title = _("账号设置"),
+            fields = {
+                {
+                    description = _("账号 (邮箱)"),
+                    text = self:get_account(),
+                    hint = _("请输入邮箱账号"),
+                },
+                {
+                    description = _("密码"),
+                    text = self:get_password(),
+                    text_type = "password",
+                    hint = _("请输入密码"),
+                },
+                {
+                    description = _("网站地址"),
+                    text = self:get_base_host(),
+                    hint = Koobone.DEFAULT_HOST,
+                },
+            },
+            buttons = {
+                {
+                    {
+                        text = _("取消"),
+                        callback = function()
+                            UIManager:close(dialog)
+                        end,
+                    },
+                    {
+                        text = _("保存并登录"),
+                        is_enter_default = true,
+                        callback = function()
+                            local fields = dialog:getFields()
+                            local account, password, host = fields[1] or "", fields[2] or "", fields[3] or ""
+                            self:set_account(account)
+                            self:set_password(password)
+                            self:set_base_host(host)
+                            self:flush()
+                            UIManager:close(dialog)
+                            do_login(account, password, host)
+                        end,
+                    },
+                    {
+                        text = _("仅保存"),
+                        callback = function()
+                            local fields = dialog:getFields()
+                            local account, password, host = fields[1] or "", fields[2] or "", fields[3] or ""
+                            self:set_account(account)
+                            self:set_password(password)
+                            self:set_base_host(host)
+                            self:flush()
+                            UIManager:close(dialog)
+                            show_info(_("设置已保存"))
+                        end,
+                    },
+                },
+            },
+        }
+        UIManager:show(dialog)
+        dialog:onShowKeyboard()
+    end
+
     return {
         -- ========== 账号设置 ==========
         {
             text = _("账号设置"),
-            sub_item_table = {
-                {
-                    text = _("账号 (邮箱)"),
-                    callback = function()
-                        input_dialog(
-                            _("账号 (邮箱)"),
-                            _("请输入邮箱账号"),
-                            self:get_account(),
-                            false,
-                            function(value)
-                                self:set_account(value)
-                                self:flush()
-                                show_info(_("账号已保存"))
-                            end
-                        )
-                    end,
-                },
-                {
-                    text = _("密码"),
-                    callback = function()
-                        input_dialog(
-                            _("密码"),
-                            _("请输入密码"),
-                            self:get_password(),
-                            true,
-                            function(value)
-                                self:set_password(value)
-                                self:flush()
-                                show_info(_("密码已保存"))
-                            end
-                        )
-                    end,
-                },
-                {
-                    text = _("网站地址"),
-                    callback = function()
-                        input_dialog(
-                            _("网站地址"),
-                            _("例如: www.koobone.com 或 https://koobone.com"),
-                            self:get_base_host(),
-                            false,
-                            function(value)
-                                self:set_base_host(value)
-                                self:flush()
-                                show_info(_("网站地址已保存"))
-                            end
-                        )
-                    end,
-                },
-                {
-                    text = _("登录"),
-                    callback = function()
-                        do_login(self:get_account(), self:get_password(), self:get_base_host())
-                    end,
-                },
-            },
+            callback = function()
+                account_dialog()
+            end,
         },
         -- ========== 下载设置 ==========
         {
@@ -644,6 +691,19 @@ function Settings:build_menu_items(plugin)
                             end,
                         },
                     },
+                },
+                {
+                    text = _("下载封面"),
+                    checked_func = function()
+                        return self:should_download_covers()
+                    end,
+                    callback = function()
+                        self:set_download_covers(not self:should_download_covers())
+                        self:flush()
+                        show_info(self:should_download_covers()
+                            and _("已开启封面下载，下次打开书架会自动下载封面")
+                            or _("已关闭封面下载"))
+                    end,
                 },
                 {
                     text = _("清除所有缓存"),

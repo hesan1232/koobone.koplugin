@@ -1,6 +1,7 @@
 local Log = require("koobone.logger")
 local H = require("koobone.helper")
 local Cookie = require("koobone.cookie")
+local Koobone = require("koobone.koobone")
 
 local ok_client, Client = pcall(require, "koobone.client")
 if not ok_client then
@@ -11,9 +12,9 @@ end
 local Auth = {}
 Auth.__index = Auth
 
-local DEFAULT_HOST = "www.koobone.com"
-local BOUNDARY = "----WebKitFormBoundaryForKoobone"
-local USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+local DEFAULT_HOST = Koobone.DEFAULT_HOST
+local BOUNDARY = Koobone.BOUNDARY
+local USER_AGENT = Koobone.USER_AGENT
 
 local function header_value(headers, name)
     if not headers then return nil end
@@ -129,10 +130,7 @@ function Auth:save_to_settings()
 end
 
 function Auth:resolve_host(base_host)
-    base_host = H.trim(base_host or self.base_host or DEFAULT_HOST)
-    if base_host == "" then
-        base_host = DEFAULT_HOST
-    end
+    base_host = Koobone.normalize_base(base_host or self.base_host or DEFAULT_HOST)
     if base_host:find("^http://") == 1 or base_host:find("^https://") == 1 then
         local scheme, hostpart = base_host:match("^(https?)://([^/]+)")
         if scheme and hostpart then
@@ -353,6 +351,7 @@ function Auth:login(account, password, base_host_opt)
     self.uin = tostring(uin)
     self.base_host = base_host
     if cookie_captured then
+        self.cookie:mark_login()
         self:save_to_settings()
         data.cookieSaved = true
         Log.info("Auth: 登录成功 uin=" .. tostring(uin) .. " cookie 已保存")
@@ -410,13 +409,37 @@ function Auth:is_logged_in()
     return self.cookie:is_valid()
 end
 
+-- Cookie 最大有效期（秒）：默认 20 小时，实际 24 小时过期，留 4 小时缓冲
+local COOKIE_MAX_AGE = 20 * 3600
+
+-- 主动检查 cookie 是否临近过期，如果是则自动刷新
+-- 返回: ok, message, data
+function Auth:refresh_cookie_if_needed(max_age_sec)
+    max_age_sec = max_age_sec or COOKIE_MAX_AGE
+    if not self.cookie:is_valid() then
+        Log.info("Auth: cookie 无效，需要重新登录")
+        return self:ensure_logged_in()
+    end
+    if self.cookie:needs_refresh(max_age_sec) then
+        local age_h = math.floor(self.cookie:age() / 3600)
+        Log.info("Auth: cookie 已使用 " .. age_h .. " 小时，主动刷新")
+        return self:ensure_logged_in()
+    end
+    return true, "Cookie 有效", { age_sec = self.cookie:age() }
+end
+
 function Auth:ensure_logged_in()
     if self.cookie:is_valid() then
-        local ok, msg, data = self:test_cookie()
-        if ok then
-            return true, "Cookie 有效", { method = "cookie", test = data }
+        -- 先检查是否需要主动刷新（cookie 年龄接近过期）
+        if self.cookie:needs_refresh(COOKIE_MAX_AGE) then
+            Log.info("Auth: Cookie 临近过期，主动重新登录")
+        else
+            local ok, msg, data = self:test_cookie()
+            if ok then
+                return true, "Cookie 有效", { method = "cookie", test = data }
+            end
+            Log.warn("Auth: Cookie 测试失败，尝试重新登录: " .. tostring(msg))
         end
-        Log.warn("Auth: Cookie 测试失败，尝试重新登录: " .. tostring(msg))
     end
     local account = H.trim(self.account or "")
     local password = H.trim(self.password or "")
