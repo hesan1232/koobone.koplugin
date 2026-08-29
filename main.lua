@@ -251,8 +251,7 @@ function KoobonePlugin:onDispatcherRegisterActions()
         category = "none",
         event = "ShowKooboneBookshelf",
         title = _("Koobone 书架"),
-        filemanager = true,
-        reader = true,
+        general  = true,
     })
 end
 
