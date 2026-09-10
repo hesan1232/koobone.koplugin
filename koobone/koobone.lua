@@ -38,4 +38,20 @@ function Koobone.is_local_host(base_host)
     return host == "127.0.0.1" or host == "localhost"
 end
 
+-- 获取设备型号（KOReader Device.model），失败时返回 unknown
+function Koobone.device_model()
+    local ok_device, Device = pcall(require, "device")
+    if ok_device and Device and Device.model then
+        return tostring(Device.model)
+    end
+    return "unknown"
+end
+
+-- 构造鉴权头 X-KB-FROM：插件名/版本 + 设备型号
+-- 与 test.py 对齐："koobone.koplugin/1.0.0 (Kindle; Oasis2)"
+function Koobone.build_kb_from(version)
+    version = version or "0.2.0"
+    return "koobone.koplugin/" .. tostring(version) .. " (" .. Koobone.device_model() .. ")"
+end
+
 return Koobone

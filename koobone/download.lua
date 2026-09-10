@@ -51,14 +51,14 @@ function Download:_lru_cleanup()
 end
 
 function Download:_do_http_download(url, save_tmp_path, expected_size, verify_ssl, fmd)
-    local cookie = self.settings:get_cookie()
-    return HttpDL.do_http_download(url, save_tmp_path, expected_size, verify_ssl, cookie)
+    -- api_key 直传鉴权：图片/文件下载无需 cookie
+    return HttpDL.do_http_download(url, save_tmp_path, expected_size, verify_ssl, "")
 end
 
 --- 带进度回调的 HTTP 下载
 function Download:_do_http_download_with_progress(url, save_tmp_path, expected_size, verify_ssl, fmd, progress_callback, cancel_check)
-    local cookie = self.settings:get_cookie()
-    return HttpDL.do_http_download_with_progress(url, save_tmp_path, expected_size, verify_ssl, cookie, progress_callback, cancel_check)
+    -- api_key 直传鉴权：图片/文件下载无需 cookie
+    return HttpDL.do_http_download_with_progress(url, save_tmp_path, expected_size, verify_ssl, "", progress_callback, cancel_check)
 end
 
 function Download:_download_epub_file(vol, file_url, expected_size, file_md5)

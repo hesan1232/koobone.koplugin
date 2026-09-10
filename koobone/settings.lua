@@ -9,13 +9,9 @@ Settings.__index = Settings
 
 local defaults = {
     auth = {
-        account = "",
-        password = "",
+        api_key = "",
         uin = "",
         base_host = Koobone.DEFAULT_HOST,
-        cookie_vlibsid = "",
-        cookie_kbskey = "",
-        auto_relogin = true,
     },
     shelf = {
         sort_order = "last_read",
@@ -101,36 +97,30 @@ end
 
 function Settings:_merge_config()
     if not self.config or type(self.config) ~= "table" then
+        Log.warn("_merge_config: config 为空，跳过合并（config.lua 未加载或加载失败）")
         return
     end
     local cfg = self.config
     local changed = false
 
-    -- auth 表: account / password / uin / base_host / cookie
+    -- auth 表: api_key / uin / base_host
     local auth = self.store:readSetting("auth") or deepcopy(defaults.auth)
-    if (not auth.account or auth.account == "") and cfg.account then
-        auth.account = cfg.account; changed = true
-    end
-    if (not auth.password or auth.password == "") and cfg.password then
-        auth.password = cfg.password; changed = true
+    -- 诊断: 记录 api_key 合并决策
+    local store_api_key = auth.api_key or ""
+    local cfg_api_key = cfg.api_key or ""
+    if store_api_key == "" and cfg_api_key ~= "" then
+        Log.info("合并 api_key: 从 config.lua 写入 store（store 原为空）")
+        auth.api_key = cfg.api_key; changed = true
+    elseif store_api_key ~= "" and cfg_api_key ~= "" and store_api_key ~= cfg_api_key then
+        Log.info("跳过合并 api_key: store 已有值（以 UI 设置为准），不覆盖 config.lua 的值")
+    elseif store_api_key == "" and cfg_api_key == "" then
+        Log.warn("api_key 均为空: config.lua 和 store 都没有 api_key，请在 Koobone 设置中填写")
     end
     if (not auth.uin or auth.uin == "") and cfg.uin and cfg.uin ~= "" then
         auth.uin = cfg.uin; changed = true
     end
     if (not auth.base_host or auth.base_host == Koobone.DEFAULT_HOST) and cfg.base_host and cfg.base_host ~= "" then
         auth.base_host = cfg.base_host; changed = true
-    end
-    -- cookie: 从 "VLIBSID=xxx; KBSKEY=yyy" 解析
-    if (not auth.cookie_vlibsid or auth.cookie_vlibsid == "") and cfg.cookie and cfg.cookie ~= "" then
-        for part in tostring(cfg.cookie):gmatch("([^;]+)") do
-            local key, value = part:match("^%s*([^=]+)=(.-)%s*$")
-            if key and value then
-                key = H.trim(key):upper()
-                value = H.trim(value)
-                if key == "VLIBSID" then auth.cookie_vlibsid = value; changed = true
-                elseif key == "KBSKEY" then auth.cookie_kbskey = value; changed = true end
-            end
-        end
     end
     if changed then self.store:saveSetting("auth", auth) end
 
@@ -181,23 +171,27 @@ end
 
 function Settings:_load_config_file()
     if not self.config_path then
+        Log.warn("config_path 为空，config.lua 不会被加载")
         return nil
     end
 
     local file = io.open(self.config_path, "r")
     if not file then
-        Log.debug("config.lua 不存在，使用默认配置")
+        Log.warn("config.lua 不存在: " .. self.config_path .. "（API Key 等配置将不会被读取）")
         return nil
     end
     file:close()
 
     local ok, config = pcall(dofile, self.config_path)
     if not ok or type(config) ~= "table" then
-        Log.error("config.lua 加载失败: " .. tostring(config))
+        Log.error("config.lua 加载失败: " .. self.config_path .. " - " .. tostring(config))
         return nil
     end
 
-    Log.info("config.lua 加载成功")
+    -- 诊断: 记录关键字段是否存在于 config.lua
+    local has_api_key = config.api_key ~= nil and config.api_key ~= ""
+    Log.info("config.lua 加载成功: " .. self.config_path
+        .. " | api_key=" .. (has_api_key and "已配置" or "缺失或为空"))
     return config
 end
 
@@ -237,23 +231,13 @@ function Settings:flush()
     end
 end
 
-function Settings:get_account()
-    return self:get("auth") and self:get("auth").account or ""
+function Settings:get_api_key()
+    return self:get("auth") and self:get("auth").api_key or ""
 end
 
-function Settings:set_account(v)
+function Settings:set_api_key(v)
     local auth = self:get("auth") or {}
-    auth.account = v or ""
-    self:set("auth", auth)
-end
-
-function Settings:get_password()
-    return self:get("auth") and self:get("auth").password or ""
-end
-
-function Settings:set_password(v)
-    local auth = self:get("auth") or {}
-    auth.password = v or ""
+    auth.api_key = v or ""
     self:set("auth", auth)
 end
 
@@ -274,48 +258,6 @@ end
 function Settings:set_base_host(v)
     local auth = self:get("auth") or {}
     auth.base_host = v or Koobone.DEFAULT_HOST
-    self:set("auth", auth)
-end
-
-function Settings:get_cookie()
-    local auth = self:get("auth") or {}
-    local parts = {}
-    if auth.cookie_vlibsid and auth.cookie_vlibsid ~= "" then
-        table.insert(parts, "VLIBSID=" .. auth.cookie_vlibsid)
-    end
-    if auth.cookie_kbskey and auth.cookie_kbskey ~= "" then
-        table.insert(parts, "KBSKEY=" .. auth.cookie_kbskey)
-    end
-    return table.concat(parts, "; ")
-end
-
-function Settings:set_cookie(cookie_str)
-    cookie_str = cookie_str or ""
-    local auth = self:get("auth") or {}
-    auth.cookie_vlibsid = ""
-    auth.cookie_kbskey = ""
-    for part in cookie_str:gmatch("([^;]+)") do
-        local key, value = part:match("^%s*([^=]+)=(.-)%s*$")
-        if key and value then
-            key = H.trim(key):upper()
-            value = H.trim(value)
-            if key == "VLIBSID" then
-                auth.cookie_vlibsid = value
-            elseif key == "KBSKEY" then
-                auth.cookie_kbskey = value
-            end
-        end
-    end
-    self:set("auth", auth)
-end
-
-function Settings:is_auto_relogin()
-    return self:get("auth") and self:get("auth").auto_relogin ~= false
-end
-
-function Settings:set_auto_relogin(v)
-    local auth = self:get("auth") or {}
-    auth.auto_relogin = v == true
     self:set("auth", auth)
 end
 
@@ -487,149 +429,37 @@ function Settings:build_menu_items(plugin)
         return count
     end
 
-    -- 辅助函数：执行登录
-    local function do_login(account, password, base_host)
-        if not (plugin and plugin.auth) then
-            show_info(_("认证模块未初始化"))
+    -- 辅助函数：保存 API Key（api_key 直传鉴权，无需校验 sess_key）
+    local function do_save_api_key(api_key)
+        if api_key == "" then
+            show_info(_("API Key 已清空"))
             return
         end
-        if account == "" or password == "" then
-            show_info(_("请先填写账号和密码"))
-            return
-        end
-        local execute = function()
-            local ok_call, login_ok, msg = pcall(function()
-                return plugin.auth:login(account, password, base_host)
-            end)
-            if not ok_call then
-                show_info(_("登录异常: ") .. tostring(login_ok))
-            elseif login_ok then
-                self:flush()
-                show_info(msg or _("登录成功"))
-            else
-                show_info(msg or _("登录失败"))
-            end
-        end
-        show_info(_("正在登录..."))
-        if ok_ui and UIManager.scheduleIn then
-            UIManager:scheduleIn(0.05, execute)
-        else
-            execute()
-        end
+        self:set_api_key(api_key)
+        self:flush()
+        show_info(_("API Key 已保存"))
     end
 
-    -- 辅助函数：测试 Cookie
-    local function do_test_cookie()
-        if not (plugin and plugin.auth) then
-            show_info(_("认证模块未初始化"))
-            return
-        end
-        local cookie = self:get_cookie()
-        if cookie == "" then
-            show_info(_("Cookie 为空，请先登录或填写 Cookie"))
-            return
-        end
-        local execute = function()
-            local ok_call, test_ok, msg = pcall(function()
-                return plugin.auth:test_cookie(cookie)
-            end)
-            if not ok_call then
-                show_info(_("测试异常: ") .. tostring(test_ok))
-            elseif test_ok then
-                show_info(msg or _("Cookie 有效"))
-            else
-                show_info(msg or _("Cookie 失效"))
+    -- API Key 设置对话框：个人页面获取的 X-KB-INFO 凭据
+    local function api_key_dialog()
+        input_dialog(
+            _("API Key 设置"),
+            _("请输入个人页面获取的 API Key"),
+            self:get_api_key(),
+            false,
+            function(value)
+                value = H.trim(value)
+                do_save_api_key(value)
             end
-        end
-        show_info(_("正在测试 Cookie..."))
-        if ok_ui and UIManager.scheduleIn then
-            UIManager:scheduleIn(0.05, execute)
-        else
-            execute()
-        end
-    end
-
-    -- 多字段账号对话框：账号 + 密码 + 网站地址 一次输入
-    -- 使用 KOReader 原生 MultiInputDialog，自动处理居中显示和焦点切换
-    local function account_dialog()
-        if not (ok_ui and ok_multiinput and ok_input) then
-            -- 回退：如果 MultiInputDialog 不可用，用旧的单字段方式
-            input_dialog(_("账号 (邮箱)"), _("请输入邮箱账号"), self:get_account(), false,
-                function(value)
-                    self:set_account(value); self:flush(); show_info(_("账号已保存"))
-                end)
-            return
-        end
-
-        local dialog
-        dialog = MultiInputDialog:new{
-            title = _("账号设置"),
-            fields = {
-                {
-                    description = _("账号 (邮箱)"),
-                    text = self:get_account(),
-                    hint = _("请输入邮箱账号"),
-                },
-                {
-                    description = _("密码"),
-                    text = self:get_password(),
-                    text_type = "password",
-                    hint = _("请输入密码"),
-                },
-                {
-                    description = _("网站地址"),
-                    text = self:get_base_host(),
-                    hint = Koobone.DEFAULT_HOST,
-                },
-            },
-            buttons = {
-                {
-                    {
-                        text = _("取消"),
-                        callback = function()
-                            UIManager:close(dialog)
-                        end,
-                    },
-                    {
-                        text = _("保存并登录"),
-                        is_enter_default = true,
-                        callback = function()
-                            local fields = dialog:getFields()
-                            local account, password, host = fields[1] or "", fields[2] or "", fields[3] or ""
-                            self:set_account(account)
-                            self:set_password(password)
-                            self:set_base_host(host)
-                            self:flush()
-                            UIManager:close(dialog)
-                            do_login(account, password, host)
-                        end,
-                    },
-                    {
-                        text = _("仅保存"),
-                        callback = function()
-                            local fields = dialog:getFields()
-                            local account, password, host = fields[1] or "", fields[2] or "", fields[3] or ""
-                            self:set_account(account)
-                            self:set_password(password)
-                            self:set_base_host(host)
-                            self:flush()
-                            UIManager:close(dialog)
-                            show_info(_("设置已保存"))
-                        end,
-                    },
-                },
-            },
-        }
-        UIManager:show(dialog)
-        dialog:onShowKeyboard()
+        )
     end
 
     return {
-        -- ========== 账号设置 ==========
+        -- ========== API Key 设置 ==========
         {
-            text = _("账号设置"),
+            text = _("API Key 设置"),
             callback = function()
-                account_dialog()
+                api_key_dialog()
             end,
         },
         -- ========== 下载设置 ==========

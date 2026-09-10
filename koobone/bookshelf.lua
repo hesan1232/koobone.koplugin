@@ -838,7 +838,7 @@ end
 -- 封面（同步阻塞下载，UI层应使用异步批量调用 download_covers）
 -- ============================================================
 
--- 封面下载：禁用 SSL 验证 + 正确 Referer + cookie
+-- 封面下载：禁用 SSL 验证 + 正确 Referer
 -- H.download_file 不禁用 SSL 验证且 Referer 用图片域名，在 Kindle 上会失败
 -- 此方法与 http_downloader.lua 的 SSL bypass 策略一致
 function Bookshelf:download_cover_file(cover_url, save_path)

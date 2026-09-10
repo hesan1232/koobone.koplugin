@@ -3,19 +3,14 @@
 -- 只有需要自动化部署时才编辑本文件；界面填写值优先级高于本文件
 
 return {
-    -- 账号密码（登录后会自动获取 Cookie 和 UIN）
-    account = "your_email@example.com",
-    password = "your_password",
+    -- API Key（从 koobone.com 个人页面获取，插件直接放到 X-KB-INFO 请求头进行鉴权）
+    -- 格式示例："kbs-1033 9221 0835 8954"（空格会被自动忽略）
+    api_key = "kbs-1033922108358954",
 
-    -- 网站地址（可选，默认 whttps://koobone.com）
-    
+    -- 网站地址（可选，默认 https://koobone.com）
     base_host = "https://koobone.com",
 
-    -- 若已手动抓包获取了 Cookie，可直接填这里跳过账号密码登录
-    -- 格式："VLIBSID=xxxxx; KBSKEY=yyyyy"
-    cookie = "",
-
-    -- 登录成功后后端返回的 uin（可选，留空会自动获取）
+    -- 登录后自动获取的用户 uin（可选，留空会自动从 API 获取）
     uin = "",
 
     -- 书架默认排序："uptime" = 按更新时间，"vol_name" = 按名字

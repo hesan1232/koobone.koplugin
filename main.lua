@@ -72,9 +72,6 @@ if not Client then return end
 local Auth = safe_require("koobone.auth", true)
 if not Auth then return end
 
-local Cookie = safe_require("koobone.cookie", true)
-if not Cookie then return end
-
 local H = safe_require("koobone.helper", true)
 if not H then return end
 
@@ -184,22 +181,11 @@ function KoobonePlugin:init()
         self.settings = Settings:new()
         State.bindSettings(self.settings)
         Log.init(self.settings)
-        self.client = Client:new(self.settings)
         self.auth = Auth:new(self.settings)
+        self.client = Client:new(self.settings, self.auth)
         self.bookshelf = Bookshelf:new(self.settings, self.client)
         self.download = Download:new(self.settings, self.client, self.bookshelf)
         self.reader = Reader:new(self)
-
-        -- 主动检查 cookie 有效性（后台异步，不阻塞 UI）
-        if self.auth:is_logged_in() then
-            Async.run(function()
-                return self.auth:refresh_cookie_if_needed()
-            end, function(ok_refresh, result)
-                if not ok_refresh then
-                    Log.info("[Koobone] cookie refresh needed: " .. tostring(result))
-                end
-            end)
-        end
 
         -- 加载补丁（图片样式调整）：提前安装，确保已打开的书也能立即生效
         self.patches_ok = false
@@ -432,14 +418,8 @@ function KoobonePlugin:showBookshelf(series_id_opt, opts)
         return
     end
 
-    -- 主动检查 cookie 状态：如果已过期或临近过期，自动续期
-    if self.auth and self.auth.refresh_cookie_if_needed then
-        local ok_refresh, msg_refresh = self.auth:refresh_cookie_if_needed()
-        if not ok_refresh then
-            self:showInfo(msg_refresh or _("登录已过期，请在 Koobone 设置中重新登录。"))
-            return
-        end
-    end
+    -- api_key 直传鉴权：无需预检查 cookie/sess_key，请求时直接放到 X-KB-INFO 头。
+    -- api_key 未配置时，ShelfView.show 会直接提示用户。
 
     -- ============================================================
     -- 分支1：force_refresh 或 首次无缓存 → 阻塞式网络请求
@@ -851,15 +831,7 @@ function KoobonePlugin:_do_download_comic(vol, force_redownload)
     local self_ref = self
     local fmd = tostring(vol.file_md5 or vol.fmd or "")
 
-    -- 下载前检查 cookie 状态
-    if self.auth and self.auth.refresh_cookie_if_needed then
-        local ok_refresh, msg_refresh = self.auth:refresh_cookie_if_needed()
-        if not ok_refresh then
-            self:showInfo(msg_refresh or _("登录已过期，请在 Koobone 设置中重新登录。"))
-            return
-        end
-    end
-
+    -- api_key 直传鉴权：无需预检查 cookie/sess_key
     -- 如果强制重新下载，先清除旧缓存
     if force_redownload and self.download then
         pcall(function()

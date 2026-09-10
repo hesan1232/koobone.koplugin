@@ -614,7 +614,7 @@ local function trigger_cover_download(opts, menu)
         local need_refresh = false
         if not H.file_exists(cover_path) then
             Log.debug("[KooboneCover] 开始下载 fmd=", tostring(item.fmd), "url=", tostring(item.url))
-            -- 使用 bookshelf:download_cover_file（SSL bypass + 正确 headers + cookie）
+            -- 使用 bookshelf:download_cover_file（SSL bypass + 正确 headers）
             -- H.download_file 不禁用 SSL 验证，在 Kindle 上会失败
             local dl_ok, dl_ret, dl_err = pcall(function()
                 return bookshelf:download_cover_file(item.url, cover_path)
@@ -628,7 +628,7 @@ local function trigger_cover_download(opts, menu)
                 -- 同时符合 project_memory "only refresh when cover download succeeds"。
                 need_refresh = true
             else
-                -- 下载失败：记录原因，方便排查（SSL/cookie/Referer/网络）
+                -- 下载失败：记录原因，方便排查（SSL/Referer/网络）
                 local reason = "未知"
                 if not dl_ok then
                     reason = "pcall异常: " .. tostring(dl_ret)
@@ -1764,12 +1764,11 @@ function ShelfView_show(opts_in)
         return nil
     end
 
-    local uin = settings:get_uin()
-    local cookie = settings:get_cookie()
-    if uin == "" or cookie == "" then
+    local api_key = settings:get_api_key()
+    if api_key == "" then
         if ok_InfoMessage then
             UIManager:show(InfoMessage:new{
-                text = _t("未登录，请先在 Koobone 设置中登录"),
+                text = _t("未配置 API Key，请先在 Koobone 设置中填写"),
                 timeout = 3,
             })
         end

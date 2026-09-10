@@ -3,6 +3,9 @@ local H = require("koobone.helper")
 local Log = require("koobone.logger")
 local Koobone = require("koobone.koobone")
 
+local ok_info, Info = pcall(require, "koobone.info")
+local CLIENT_VERSION = ok_info and Info and Info.version or "0.2.0"
+
 local ok_https, https = pcall(require, "ssl.https")
 local ok_http, http = pcall(require, "socket.http")
 
@@ -91,9 +94,10 @@ local function transport_request(transport, request, timeout)
     return result1, result2, result3, result4
 end
 
-function Client:new(settings)
+function Client:new(settings, auth)
     local obj = setmetatable({
         settings = settings,
+        auth = auth,
     }, self)
     return obj
 end
@@ -192,15 +196,15 @@ function Client:request(opts)
     headers["Connection"] = "keep-alive"
     headers["X-Requested-With"] = "XMLHttpRequest"
 
-    local ref_or_path = opts.path or path
-    headers["X-KB-FROM"] = headers["X-KB-FROM"] or string.format("KOOBONE/5.0.0 %s %s", method, ref_or_path)
+    -- 认证：X-KB-INFO 直接使用个人页面 API Key
+    local api_key = self.auth and self.auth.get_api_key and self.auth:get_api_key() or ""
+    if api_key ~= "" then
+        headers["X-KB-INFO"] = api_key
+    end
+
+    headers["X-KB-FROM"] = headers["X-KB-FROM"] or Koobone.build_kb_from(CLIENT_VERSION)
     headers["Referer"] = headers["Referer"] or (scheme .. "://" .. base_host .. "/")
     headers["Origin"] = headers["Origin"] or (scheme .. "://" .. base_host)
-
-    local cookie = self.settings:get_cookie()
-    if cookie and cookie ~= "" then
-        headers["Cookie"] = cookie
-    end
 
     if body then
         headers["Content-Length"] = tostring(#body)
@@ -255,13 +259,8 @@ function Client:get_binary(url, opts)
     end
 
     local scheme_host = url:match("^(https?://[^/]+)") or ""
-    local cookie = self.settings:get_cookie()
 
-    -- CDN 图片请求：严格按照用户提供的成功 curl 命令构建 headers：
-    --   1. 必须带登录 Cookie (KBSKEY/VLIBSID 等) — 防盗链靠 Cookie，不是 Referer
-    --   2. 不带 Referer (curl 里 sec-fetch-site: none → 直接导航无来源)
-    --   3. Accept 用浏览器标准格式 (包含 text/html)，不是纯 image/*
-    --   4. User-Agent 保持桌面浏览器
+    -- CDN 图片请求：api_key 直传鉴权，无需 cookie
     -- 如果调用方显式传了 opts.referer / opts.headers 则以调用方为准。
     local headers = {
         ["User-Agent"] = DESKTOP_UA,
@@ -274,9 +273,6 @@ function Client:get_binary(url, opts)
     }
     if opts.referer then
         headers["Referer"] = opts.referer
-    end
-    if cookie and cookie ~= "" then
-        headers["Cookie"] = cookie
     end
     if opts.headers then
         for k, v in pairs(opts.headers) do
@@ -331,36 +327,8 @@ function Client:is_auth_error(code, body_text)
 end
 
 function Client:get_user_info()
-    Log.debug("[Koobone] get_user_info: 请求 /uinfo.php?v=none&ver=0")
-    local text, code = self:request({
-        method = "GET",
-        path = "/uinfo.php",
-        query_str = "v=none&ver=0",
-    })
-
-    if not code or code < 200 or code >= 300 then
-        error("获取用户信息失败: HTTP " .. tostring(code))
-    end
-
-    local ok, data = pcall(function()
-        return self:json_decode(text)
-    end)
-
-    if not ok or not data then
-        Log.warn("[Koobone] get_user_info JSON解析失败, 原始响应前200字节: ", tostring(text or ""):sub(1, 200))
-        error("获取用户信息失败: 响应解析失败")
-    end
-
-    local uin = ""
-    if type(data) == "table" then
-        uin = tostring(data.uin or data.uid or data.user_uin or data.id or "")
-        if uin == "" and data.data and type(data.data) == "table" then
-            uin = tostring(data.data.uin or data.data.uid or data.data.user_uin or data.data.id or "")
-        end
-    end
-
-    Log.info("[Koobone] get_user_info 成功, uin=" .. uin)
-    return data, uin
+    -- api_key 直传鉴权：服务端从 X-KB-INFO 头推导用户身份，无需客户端传 uin
+    return { uin = "" }, ""
 end
 
 local function normalize_vol_item(item)
@@ -477,17 +445,7 @@ function Client:get_vol_list(params)
         end
     end
 
-    local uin = self.settings:get_uin()
-    if not uin or uin == "" then
-        local _, auto_uin = self:get_user_info()
-        uin = auto_uin
-    end
-    if not uin or uin == "" then
-        error("获取卷列表失败: 无法获取 uin")
-    end
-
     Log.info("[Koobone] get_vol_list: sort=" .. sort .. ", limit=" .. limit
-        .. ", uin=" .. tostring(uin)
         .. (by_series and (", sid=" .. sid .. ", sna=" .. sna) or ", global"))
 
     local all_vols = {}
@@ -495,8 +453,7 @@ function Client:get_vol_list(params)
     local totalpage = 1
 
     while current_page <= totalpage do
-        local query = "u=" .. H.url_encode(uin)
-            .. "&by=" .. H.url_encode(sort)
+        local query = "by=" .. H.url_encode(sort)
             .. "&limit=" .. H.url_encode(tostring(limit))
             .. "&page=" .. H.url_encode(tostring(current_page))
         if by_series then
@@ -594,19 +551,9 @@ function Client:get_series_list(params)
         return SERIES_LIST_CACHE.data
     end
 
-    local uin = self.settings:get_uin()
-    if not uin or uin == "" then
-        local _, auto_uin = self:get_user_info()
-        uin = auto_uin
-    end
-    if not uin or uin == "" then
-        error("获取系列列表失败: 无法获取 uin")
-    end
+    Log.info("[Koobone] get_series_list: sort=" .. sort)
 
-    Log.info("[Koobone] get_series_list: sort=" .. sort .. ", uin=" .. tostring(uin))
-
-    local query = "u=" .. H.url_encode(uin)
-        .. "&by=" .. H.url_encode(sort)
+    local query = "by=" .. H.url_encode(sort)
         .. "&limit=" .. H.url_encode(tostring(limit))
         .. "&page=" .. H.url_encode(tostring(page))
 
@@ -690,18 +637,9 @@ function Client:get_series_list(params)
 end
 
 function Client:report_read_page(fmd, page, total_or_nil)
-    local uin = self.settings:get_uin()
-    if not uin or uin == "" then
-        local _, auto_uin = self:get_user_info()
-        uin = auto_uin
-    end
-    if not uin or uin == "" then
-        return false, "无法获取 uin", nil, false
-    end
-
     local base_url, scheme, base_host = self:_build_base_url()
     local ts = tostring(os.time())
-    local query_str = "act=readpage&uin=" .. H.url_encode(uin)
+    local query_str = "act=readpage"
         .. "&fmd=" .. H.url_encode(fmd)
         .. "&par=" .. H.url_encode(tostring(page or 0))
         .. "&r=" .. ts
@@ -710,7 +648,7 @@ function Client:report_read_page(fmd, page, total_or_nil)
         query_str = query_str .. "&par2=" .. H.url_encode(tostring(total_or_nil))
     end
 
-    Log.debug("[Koobone] report_read_page: fmd=" .. fmd .. ", page=" .. tostring(page) .. ", uin=" .. uin)
+    Log.debug("[Koobone] report_read_page: fmd=" .. fmd .. ", page=" .. tostring(page))
 
     local text, code, headers, status
     local ok, err = pcall(function()
@@ -719,7 +657,7 @@ function Client:report_read_page(fmd, page, total_or_nil)
             path = "/vol_act.php",
             query_str = query_str,
             headers = {
-                ["X-KB-FROM"] = "KOOBONE/5.0.0 WEB(7) GET /web.htm",
+                ["X-KB-FROM"] = Koobone.build_kb_from(CLIENT_VERSION),
                 ["Referer"] = scheme .. "://" .. base_host .. "/web.htm",
             },
             return_header = true,
@@ -756,21 +694,12 @@ function Client:report_read_page(fmd, page, total_or_nil)
 end
 
 function Client:report_uptime(fmd)
-    local uin = self.settings:get_uin()
-    if not uin or uin == "" then
-        local _, auto_uin = self:get_user_info()
-        uin = auto_uin
-    end
-    if not uin or uin == "" then
-        return false, "无法获取 uin", nil
-    end
-
     local ts = tostring(os.time())
-    local query_str = "act=uptime&uin=" .. H.url_encode(uin)
+    local query_str = "act=uptime"
         .. "&fmd=" .. H.url_encode(fmd)
         .. "&r=" .. ts
 
-    Log.debug("[Koobone] report_uptime: fmd=" .. fmd .. ", uin=" .. uin)
+    Log.debug("[Koobone] report_uptime: fmd=" .. fmd)
 
     local text, code = self:request({
         method = "GET",
