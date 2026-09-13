@@ -52,12 +52,21 @@ KOReader 菜单 → 插件 → Koobone 漫画 → 打开书架
 | 配置项 | 说明 |
 |--------|------|
 | **服务器地址** | Koobone API 地址（默认 `https://koobone.com`） |
-| **登录 Cookie** | 手动设置登录 Cookie（VLIBSID + KBSKEY） |
+| **API Key 设置** | 在 [koobone.com](https://koobone.com/) 官网登录后，进入"个人设置"页面获取 API Key，填入此处即可 |
 | **排序方式** | 书架默认排序：更新时间 / 名称 / 最后阅读 |
 | **预下载卷数** | 打开漫画后自动预下载的后续卷数 |
 | **缓存大小上限** | EPUB 缓存最大占用空间（MB） |
 | **进度上传间隔** | 阅读时自动上传进度的间隔（秒） |
 | **下载封面** | 是否下载漫画封面到本地 |
+
+### API Key 获取步骤
+
+1. 浏览器打开 [https://koobone.com/](https://koobone.com/) 并登录账号
+2. 进入"个人设置"页面（通常位于右上角用户菜单内）
+3. 找到"API Key"或"接口密钥"项，复制显示的字符串
+4. 回到 KOReader：菜单 → 插件 → Koobone 漫画 → 设置 → **API Key 设置**，粘贴保存
+
+API Key 通过 `X-KB-INFO` 请求头直传服务端鉴权，无需配置 Cookie/Session。如果未配置 API Key，打开书架时会提示"未配置 API Key，请先在 Koobone 设置中填写"。
 
 ## 技术架构
 
