@@ -282,6 +282,15 @@ function H.safe_filename(name)
     return name
 end
 
+--- 生成封面缓存文件名（统一入口，保证 VFAT/Kindle 兼容）
+-- fmd 可能是 file_md5（纯 hex，安全），也可能是 series_KMOE:27464 这种含冒号的字符串
+-- Kindle VFAT 不接受 : 等字符，必须经过 safe_filename 处理
+-- @param fmd 卷的 file_md5 或系列伪 fmd（如 "series_KMOE:xxx"）
+-- @return safe_filename(fmd) .. ".jpg"
+function H.cover_filename_for(fmd)
+    return H.safe_filename(tostring(fmd or "unknown")) .. ".jpg"
+end
+
 --- 为 vol 生成系列子目录名（不含 epub_dir 前缀，不含首尾分隔符）
 -- 规则: safe(vol.series or vol.vol_series or vol.series_id)
 -- 若无系列信息，返回空字符串（表示直接放在 epub_dir 根目录）

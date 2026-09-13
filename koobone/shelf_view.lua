@@ -610,7 +610,7 @@ local function trigger_cover_download(opts, menu)
         idx = idx + 1
         local covers_dir = H.get_covers_dir()
         H.make_dir(covers_dir)
-        local cover_path = H.join_path(covers_dir, item.fmd .. ".jpg")
+        local cover_path = H.join_path(covers_dir, H.cover_filename_for(item.fmd))
         local need_refresh = false
         if not H.file_exists(cover_path) then
             Log.debug("[KooboneCover] 开始下载 fmd=", tostring(item.fmd), "url=", tostring(item.url))
@@ -706,10 +706,11 @@ local function refresh_shelf(opts, menu)
             })
             return
         end
-        -- 同步模式：result_or_err 是 refresh 的复合 table，做 prefill
-        if type(result_or_err) == "table" and result_or_err.all_vols then
+        -- 同步模式：result_or_err 是 refresh 的复合 table
+        -- 用 apply_refresh_result 把 series + all_vols 写入父进程内存
+        if type(result_or_err) == "table" and result_or_err.series then
             pcall(function()
-                plugin_ref.bookshelf:_prefill_series_vols(result_or_err.all_vols, result_or_err.series)
+                plugin_ref.bookshelf:apply_refresh_result(result_or_err)
             end)
         end
         refresh_current(menu)
@@ -738,10 +739,11 @@ local function refresh_shelf(opts, menu)
                 })
                 return
             end
-            -- 预拉全局 vol_list 数据已通过子进程返回，在父进程做 prefill
-            if type(result) == "table" and result.all_vols then
+            -- 异步模式：用 apply_refresh_result 把子进程返回的 series + all_vols
+            -- 重新写入父进程内存，解决 Async.run 跨进程隔离
+            if type(result) == "table" and result.series then
                 pcall(function()
-                    plugin_ref.bookshelf:_prefill_series_vols(result.all_vols, result.series)
+                    plugin_ref.bookshelf:apply_refresh_result(result)
                 end)
             end
             -- 成功：动态更新当前菜单内容（保持页码/焦点）
@@ -1861,9 +1863,9 @@ function ShelfView_show(opts_in)
             -- 书架视图：刷新书架数据
             if force_api then
                 local ok_rf, result_rf = pcall(function() return rbookshelf:refresh(true) end)
-                if ok_rf and type(result_rf) == "table" and result_rf.all_vols then
+                if ok_rf and type(result_rf) == "table" and result_rf.series then
                     pcall(function()
-                        rbookshelf:_prefill_series_vols(result_rf.all_vols, result_rf.series)
+                        rbookshelf:apply_refresh_result(result_rf)
                     end)
                 end
             end

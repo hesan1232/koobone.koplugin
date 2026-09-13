@@ -362,7 +362,7 @@ function Bookshelf:check_cover_exists(vol)
     if fmd == "" then return nil end
     if self.covers[fmd] then return self.covers[fmd] end
     local covers_dir = H.get_covers_dir()
-    local cover_path = H.join_path(covers_dir, fmd .. ".jpg")
+    local cover_path = H.join_path(covers_dir, H.cover_filename_for(fmd))
     if H.file_exists(cover_path) then
         self.covers[fmd] = cover_path
         return cover_path
@@ -431,8 +431,9 @@ function Bookshelf:refresh(force)
     -- 预拉全局 vol_list（在子进程里执行，把数据带回父进程做 prefill）
     -- 目的：用户点进任何系列时 L1/L2 直接命中，0 延迟秒开
     -- 设计：失败不影响主流程，用户点目录时仍能走 L4 原路径
-    -- 注意：refresh 在 Async.run 子进程里执行，对 SERIES_VOLS_MEM 的修改不会反映到父进程
-    --       所以这里只拉取数据，由父进程的 on_done 回调调用 _prefill_series_vols
+    -- 注意：refresh 在 Async.run 子进程里执行，对 SERIES_MEM_CACHE/SERIES_VOLS_MEM 的修改
+    --       不会反映到父进程。所以子进程只拉取数据，由父进程的 on_done 回调调用
+    --       apply_refresh_result 重建父进程内存（series + all_vols）
     --       Async.run 的 child_entry 只捕获第一个返回值，所以用复合 table 打包
     --       _raw 字段未被使用且会增大 JSON 体积，strip 掉减轻跨进程传递开销
     -- ========================================================
@@ -463,8 +464,8 @@ function Bookshelf:refresh(force)
         end
     end
 
-    -- 返回复合 table：series_list 兼容旧调用方（truthy 检查），all_vols 供父进程 prefill
-    -- 父进程 on_done 里检查 result.all_vols 并调用 _prefill_series_vols
+    -- 返回复合 table：series + all_vols，父进程 on_done 调用 apply_refresh_result 重建内存
+    -- 旧调用方做 truthy 检查（if not result）仍兼容（{} 是 truthy 但 nil 不是，这里返回非 nil table）
     -- 同样 strip series 的 _raw 字段
     local series_for_return = raw_series
     for _, s in ipairs(series_for_return) do
@@ -712,6 +713,50 @@ function Bookshelf:get_series_vols(series_id, opts)
     -- 返回浅拷贝 + sort（固定卷目录顺序，不跟随书架 sort）
     local result = shallow_copy_list(vols)
     return self:_sort_vols_catalog(result)
+end
+
+--- 把 refresh 子进程返回的结果应用到父进程内存
+-- 解决 Async.run 跨进程隔离：refresh 在子进程里更新了 SERIES_MEM_CACHE/SERIES_VOLS_MEM，
+-- 但父进程的 local upvalue 不受影响，导致刷新后界面仍是旧数据。
+-- 此方法在父进程 on_done 回调里调用，用子进程返回的 series + all_vols 重建父进程内存缓存。
+-- @param result refresh 返回的复合 table: { series=..., all_vols=... }
+-- @return 成功返回 true
+function Bookshelf:apply_refresh_result(result)
+    if type(result) ~= "table" then
+        Log.warn("[apply_refresh_result] result 非 table，跳过")
+        return false
+    end
+    local series = result.series
+    if not series or #series == 0 then
+        Log.warn("[apply_refresh_result] series 为空，跳过")
+        return false
+    end
+
+    -- 1. 更新 SERIES_MEM_CACHE（书架主数据，L1）
+    --    save_shelf_cache 子进程版本写的 SERIES_MEM_CACHE 父进程看不到，这里补写
+    SERIES_MEM_CACHE = shallow_copy_list(series)
+    SERIES_MEM_TS = os.time()
+    -- state 层（L2）补写——子进程的 state.setShelfVols 同样不影响父进程
+    state.setShelfVols(series)
+    Log.info("[apply_refresh_result] 父进程 SERIES_MEM_CACHE 已更新, 共 " .. #series .. " 系列")
+
+    -- 2. 更新 SERIES_VOLS_MEM（卷目录缓存，L1）
+    --    子进程的 SERIES_VOLS_MEM = {} 清空操作不影响父进程，父进程可能仍是旧数据
+    --    这里先清空，再由 _prefill_series_vols 用新数据重建
+    --    注意：父进程可能本来就 hold 着旧 vols（用户重启插件前的数据），必须清
+    SERIES_VOLS_MEM = {}
+    -- state 层目录缓存也清空（子进程 invalidateDirectoryCache 不影响父进程）
+    state.invalidateDirectoryCache()
+    state.invalidateDownloadedVols()
+
+    -- 3. 预填全局 vol_list 到各系列目录缓存
+    if result.all_vols and #result.all_vols > 0 then
+        self:_prefill_series_vols(result.all_vols, series)
+    else
+        Log.debug("[apply_refresh_result] 无 all_vols 预填数据（可能预拉失败）")
+    end
+
+    return true
 end
 
 --- 全局 vol_list 预填各系列卷目录缓存
@@ -1004,7 +1049,7 @@ function Bookshelf:get_cover_local_path(vol)
     end
     local covers_dir = H.get_covers_dir()
     H.make_dir(covers_dir)
-    local filename = fmd .. ".jpg"
+    local filename = H.cover_filename_for(fmd)
     local cover_path = H.join_path(covers_dir, filename)
     if H.file_exists(cover_path) then
         local lfs = require("libs/libkoreader-lfs")
@@ -1049,7 +1094,7 @@ function Bookshelf:download_covers(vols)
         if not vol.cover_path then
             local fmd = tostring(vol.file_md5 or vol.fmd or "")
             if fmd ~= "" and vol.cover_url and vol.cover_url ~= "" then
-                local cover_path = H.join_path(covers_dir, fmd .. ".jpg")
+                local cover_path = H.join_path(covers_dir, H.cover_filename_for(fmd))
                 if not H.file_exists(cover_path) then
                     local ok_dl, err_dl = pcall(function()
                         local data = self.client:get_binary(vol.cover_url, { timeout = 30 })

@@ -129,6 +129,63 @@ M.install = function()
         end
         ReadHistory[M._mark] = true
     end
+
+    -- =========================================================================
+    -- 补丁4：ReaderStyleTweak — 延迟的 updateCssText 在 ReaderUI 关闭后到达时跳过
+    -- 场景：patchReaderUI 里 scheduleIn(2.0) 触发的 st:updateCssText(true) 可能在
+    --       ReaderUI 已关闭、document 已 nil 后才执行，导致 stale 引用崩
+    -- =========================================================================
+    local ok_RST, ReaderStyleTweak = pcall(require, "apps/reader/modules/readerstyletweak")
+    if ok_RST and ReaderStyleTweak and not ReaderStyleTweak._koobone_stale_stylesheet_guard_applied then
+        local original_updateCssText = ReaderStyleTweak.updateCssText
+        if type(original_updateCssText) == "function" then
+            ReaderStyleTweak._koobone_stale_stylesheet_guard_applied = true
+            ReaderStyleTweak.updateCssText = function(self, apply, ...)
+                -- Koobone 延迟的样式更新可能在 ReaderUI 关闭后才到达，
+                -- 此时 self.ui 或 self.ui.document 已 nil，应用会崩
+                if apply and (not self.ui or not self.ui.document) then
+                    return
+                end
+                return original_updateCssText(self, apply, ...)
+            end
+        end
+    end
+
+    -- =========================================================================
+    -- 补丁5：Button — 异步书架重建后旧按钮 dimen 被清除，tap 队列仍触发时跳过 unsafe painting
+    -- 场景：封面下载失败 → bookshelf 立即重建 UI → 旧按钮的 dimen 已 nil
+    --       但 tap 队列里还有事件，触发 Button:onTapSelectButton 访问 frame.dimen 崩
+    --       (button.lua:415 attempt to index field 'dimen' (a nil value))
+    -- 修复：dimen 缺失时跳过 unsafe painting（高亮/invalidate），但 callback 仍执行
+    -- =========================================================================
+    local ok_Btn, Button = pcall(require, "ui/widget/button")
+    if ok_Btn and Button and not Button._koobone_stale_tap_guard_applied then
+        local original_onTapSelectButton = Button.onTapSelectButton
+        if type(original_onTapSelectButton) == "function" then
+            Button._koobone_stale_tap_guard_applied = true
+            Button.onTapSelectButton = function(self, ...)
+                local frame = self[1]
+                if not frame or not frame.dimen then
+                    -- 异步书架重建释放了按钮，但 tap 队列里仍有事件
+                    -- 跳过 unsafe painting，但用户动作必须执行
+                    if self.enabled or self.allow_tap_when_disabled then
+                        if self.callback then
+                            self.callback()
+                        elseif self.tap_input then
+                            self:onInput(self.tap_input)
+                        elseif self.tap_input_func then
+                            self:onInput(self.tap_input_func())
+                        end
+                    end
+                    if self.readonly ~= true then
+                        return true
+                    end
+                    return
+                end
+                return original_onTapSelectButton(self, ...)
+            end
+        end
+    end
 end
 
 return M

@@ -477,14 +477,15 @@ function KoobonePlugin:showBookshelf(series_id_opt, opts)
                 return
             end
             self_ref._shelf_initialized = true
-            self_ref:showBookList(series_id_opt)
-            -- 预拉全局 vol_list 数据已通过子进程返回，在父进程做 prefill
-            -- prefill 是纯内存操作（写 SERIES_VOLS_MEM + state），很快，不阻塞 UI
-            if type(result) == "table" and result.all_vols then
+            -- 关键：refresh 在 Async.run 子进程里执行，子进程对 SERIES_MEM_CACHE/SERIES_VOLS_MEM
+            -- 的修改不影响父进程。必须用 apply_refresh_result 把子进程返回的 series + all_vols
+            -- 重新写入父进程内存，否则刷新后界面仍是旧数据（需重启插件才生效）
+            if type(result) == "table" and result.series then
                 pcall(function()
-                    self_ref.bookshelf:_prefill_series_vols(result.all_vols, result.series)
+                    self_ref.bookshelf:apply_refresh_result(result)
                 end)
             end
+            self_ref:showBookList(series_id_opt)
             -- 封面下载交给 ShelfView.show 后的 trigger_cover_download（逐个下载+每个yield UI）
             -- 不在这个回调里再 fork 第二个 Async.run（连续fork会导致UI卡顿）
         end, { timeout = 120, poll_interval = 0.3 })
@@ -589,6 +590,13 @@ function KoobonePlugin:showBookshelf(series_id_opt, opts)
                 return
             end
             self_ref._shelf_initialized = true
+            -- 同 force_refresh 分支：apply_refresh_result 把子进程的 series + all_vols
+            -- 重新写入父进程内存，解决 Async.run 跨进程隔离
+            if type(result) == "table" and result.series then
+                pcall(function()
+                    self_ref.bookshelf:apply_refresh_result(result)
+                end)
+            end
             -- 成功：用 ShelfView.update 原地更新，不关闭旧菜单
             if has_cache then
                 if self_ref.book_list_menu then
@@ -596,12 +604,6 @@ function KoobonePlugin:showBookshelf(series_id_opt, opts)
                 end
             else
                 self_ref:showBookList(series_id_opt)
-            end
-            -- 预拉全局 vol_list 数据已通过子进程返回，在父进程做 prefill
-            if type(result) == "table" and result.all_vols then
-                pcall(function()
-                    self_ref.bookshelf:_prefill_series_vols(result.all_vols, result.series)
-                end)
             end
             -- 封面下载交给 ShelfView.show/update 后的 trigger_cover_download（逐个下载）
         end, { timeout = 120, poll_interval = 0.3 })
