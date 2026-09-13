@@ -30,7 +30,7 @@ function Reader:start_progress_session(vol)
 
     local epub_path = nil
     if self.plugin and self.plugin.download then
-        epub_path = self.plugin.download:_epub_path(fmd, vol.file_md5)
+        epub_path = self.plugin.download:_resolve_epub_path(vol, fmd, vol.file_md5)
     end
 
     -- ---- 进度来源：本地(LOCAL_VOL_INDEX) > 云端/API(vol.last_readpage) ----

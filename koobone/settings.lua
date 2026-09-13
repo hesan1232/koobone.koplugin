@@ -467,11 +467,11 @@ function Settings:build_menu_items(plugin)
             text = _("下载设置"),
             sub_item_table = {
                 {
-                    text = _("预下载章节数"),
+                    text = _("预下载卷数"),
                     callback = function()
                         input_dialog(
-                            _("预下载章节数"),
-                            _("阅读时提前下载后 N 章 (0 表示不预下载)"),
+                            _("预下载卷数"),
+                            _("阅读时提前下载后 N 卷 (0 表示不预下载)"),
                             tostring(self:get_pre_download_chapters()),
                             false,
                             function(value)

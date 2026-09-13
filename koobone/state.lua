@@ -11,12 +11,12 @@ local M = {
     download_history = {},    -- 最近10条下载历史
     progress_upload_task = nil,
     last_read_time = {},
-    -- 目录缓存：key=series_id, value={ ts=过期时间戳, vols={...} }
+    -- 系列目录缓存：key=series_id, value={ ts=过期时间戳, vols={...} }
     directory_cache = {},
     DIRECTORY_CACHE_TTL = 24 * 60 * 60,  -- 24小时（与 fanqie 一致）
-    -- 章节下载索引缓存：key=series_id, value={ ts=过期时间戳, downloaded={fmd=true, ...} }
-    chapter_index_cache = {},
-    CHAPTER_INDEX_CACHE_TTL = 24 * 60 * 60,
+    -- 已下载卷索引缓存：key=series_id, value={ ts=过期时间戳, downloaded={fmd=true, ...} }
+    vol_index_cache = {},
+    VOL_INDEX_CACHE_TTL = 24 * 60 * 60,
 }
 
 local DOWNLOAD_HISTORY_MAX = 10  -- 与用户确认：保留最近10条
@@ -382,32 +382,32 @@ function M.invalidateDirectoryCache(series_id)
 end
 
 -- ============================================================
--- 章节下载索引缓存（24h TTL，避免每次都查文件系统）
+-- 已下载卷索引缓存（24h TTL，避免每次都查文件系统）
 -- ============================================================
-function M.setDownloadedChapters(series_id, downloaded_map)
+function M.setDownloadedVols(series_id, downloaded_map)
     if not series_id then return end
-    M.chapter_index_cache[tostring(series_id)] = {
+    M.vol_index_cache[tostring(series_id)] = {
         ts = os.time(),
         downloaded = downloaded_map or {},
     }
 end
 
-function M.getDownloadedChapters(series_id)
+function M.getDownloadedVols(series_id)
     if not series_id then return nil end
-    local cache = M.chapter_index_cache[tostring(series_id)]
+    local cache = M.vol_index_cache[tostring(series_id)]
     if not cache then return nil end
-    if os.time() - cache.ts > M.CHAPTER_INDEX_CACHE_TTL then
-        M.chapter_index_cache[tostring(series_id)] = nil
+    if os.time() - cache.ts > M.VOL_INDEX_CACHE_TTL then
+        M.vol_index_cache[tostring(series_id)] = nil
         return nil
     end
     return cache.downloaded
 end
 
-function M.invalidateDownloadedChapters(series_id)
+function M.invalidateDownloadedVols(series_id)
     if series_id then
-        M.chapter_index_cache[tostring(series_id)] = nil
+        M.vol_index_cache[tostring(series_id)] = nil
     else
-        M.chapter_index_cache = {}
+        M.vol_index_cache = {}
     end
 end
 

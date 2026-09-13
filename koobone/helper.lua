@@ -261,6 +261,104 @@ function H.get_pages_dir()
 end
 
 -- ============================================================
+-- EPUB 缓存文件名生成（统一入口，供 download/bookshelf/shelf_view 共用）
+-- ============================================================
+
+--- 将任意字符串转为文件系统安全的文件名片段
+-- 替换 Windows/Linux 禁止字符，去控制字符和首尾空白/点，折叠连续空格，截断长度
+function H.safe_filename(name)
+    if not name then return "" end
+    if type(name) ~= "string" then name = tostring(name) end
+    -- 替换 Windows / Linux 文件名禁止字符: \ / : * ? " < > |
+    name = name:gsub('[\\/:*?"<>|]', "_")
+    -- 去除控制字符
+    name = name:gsub("%c", "")
+    -- 折叠连续空白为单空格
+    name = name:gsub("%s+", " ")
+    -- 去除首尾空格和点（Windows 不允许结尾是 . 或空格）
+    name = name:gsub("^[%s.]+", ""):gsub("[%s.]+$", "")
+    -- 截断到 120 字符
+    if #name > 120 then name = name:sub(1, 120) end
+    return name
+end
+
+--- 为 vol 生成系列子目录名（不含 epub_dir 前缀，不含首尾分隔符）
+-- 规则: safe(vol.series or vol.vol_series or vol.series_id)
+-- 若无系列信息，返回空字符串（表示直接放在 epub_dir 根目录）
+function H.epub_subdir_for_vol(vol)
+    if not vol then return "" end
+    local series = vol.series or vol.vol_series or vol.series_id
+    if not series or series == "" then return "" end
+    local safe = H.safe_filename(series)
+    return safe
+end
+
+--- 为 vol 生成新命名规则的 epub 文件名（不含目录，含 .epub 后缀）
+-- 规则: {safe(vol_name or title)}.epub
+-- 若 vol 为空或无 vol_name/title，回退到旧规则 {file_md5}.epub
+function H.epub_filename_for_vol(vol, fmd, file_md5)
+    local key_fmd = tostring(file_md5 or fmd or "")
+    if key_fmd == "" then key_fmd = "unknown" end
+    key_fmd = H.trim(key_fmd)
+    local vol_name = vol and (vol.vol_name or vol.title) or nil
+    if not vol_name or vol_name == "" then
+        -- 回退到旧规则
+        return key_fmd .. ".epub"
+    end
+    local safe = H.safe_filename(vol_name)
+    if safe == "" then
+        return key_fmd .. ".epub"
+    end
+    return safe .. ".epub"
+end
+
+--- 旧命名规则（纯 file_md5），仅用于兼容查找/删除
+-- 旧版所有 epub 都在 epub_dir 根目录，命名为 {file_md5}.epub
+function H.epub_legacy_filename(fmd, file_md5)
+    local key = tostring(file_md5 or fmd or "unknown")
+    return H.trim(key) .. ".epub"
+end
+
+--- 解析 vol 对应的已存在 EPUB 路径
+-- 优先返回新命名路径（按系列分子目录）；若不存在则尝试旧命名（根目录），命中时自动迁移到新命名
+-- 若都不存在，确保新路径的父目录存在，返回新路径供调用方写入下载文件
+-- @param epub_dir EPUB 缓存根目录
+-- @param vol 卷信息表（可为空）
+-- @param fmd 字符串标识
+-- @param file_md5 文件 MD5（可与 fmd 相同）
+-- @return path 已存在或待写入的 epub 路径
+function H.resolve_epub_path(epub_dir, vol, fmd, file_md5)
+    local new_name = H.epub_filename_for_vol(vol, fmd, file_md5)
+    local subdir = H.epub_subdir_for_vol(vol)
+    local new_full_dir = epub_dir
+    if subdir and subdir ~= "" then
+        new_full_dir = H.join_path(epub_dir, subdir)
+    end
+    local new_path = H.join_path(new_full_dir, new_name)
+    if H.file_exists(new_path) then
+        return new_path
+    end
+    -- 兼容旧命名查找（旧版在 epub_dir 根目录）
+    local legacy_name = H.epub_legacy_filename(fmd, file_md5)
+    if legacy_name ~= new_name then
+        local legacy_path = H.join_path(epub_dir, legacy_name)
+        if H.file_exists(legacy_path) then
+            -- 尝试迁移到新命名（先确保新目录存在）
+            H.make_dir(new_full_dir)
+            local ok_rename = pcall(function() os.rename(legacy_path, new_path) end)
+            if H.file_exists(new_path) then
+                return new_path
+            end
+            -- 迁移失败（文件被占用等），返回旧路径
+            return legacy_path
+        end
+    end
+    -- 新文件，确保父目录存在供调用方写入
+    H.make_dir(new_full_dir)
+    return new_path
+end
+
+-- ============================================================
 -- 路径 / URL 工具
 -- ============================================================
 

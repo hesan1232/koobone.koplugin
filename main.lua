@@ -478,6 +478,13 @@ function KoobonePlugin:showBookshelf(series_id_opt, opts)
             end
             self_ref._shelf_initialized = true
             self_ref:showBookList(series_id_opt)
+            -- 预拉全局 vol_list 数据已通过子进程返回，在父进程做 prefill
+            -- prefill 是纯内存操作（写 SERIES_VOLS_MEM + state），很快，不阻塞 UI
+            if type(result) == "table" and result.all_vols then
+                pcall(function()
+                    self_ref.bookshelf:_prefill_series_vols(result.all_vols, result.series)
+                end)
+            end
             -- 封面下载交给 ShelfView.show 后的 trigger_cover_download（逐个下载+每个yield UI）
             -- 不在这个回调里再 fork 第二个 Async.run（连续fork会导致UI卡顿）
         end, { timeout = 120, poll_interval = 0.3 })
@@ -590,6 +597,12 @@ function KoobonePlugin:showBookshelf(series_id_opt, opts)
             else
                 self_ref:showBookList(series_id_opt)
             end
+            -- 预拉全局 vol_list 数据已通过子进程返回，在父进程做 prefill
+            if type(result) == "table" and result.all_vols then
+                pcall(function()
+                    self_ref.bookshelf:_prefill_series_vols(result.all_vols, result.series)
+                end)
+            end
             -- 封面下载交给 ShelfView.show/update 后的 trigger_cover_download（逐个下载）
         end, { timeout = 120, poll_interval = 0.3 })
         return
@@ -637,7 +650,7 @@ function KoobonePlugin:open_comic(vol_or_fmd)
         return
     end
 
-    local epub_path = self.download and self.download:_epub_path(fmd, vol.file_md5)
+    local epub_path = self.download and self.download:_resolve_epub_path(vol, fmd, vol.file_md5)
     if not epub_path or not lfs.attributes(epub_path, "mode") then
         self:showInfo(_("EPUB 文件未下载"))
         return
@@ -835,7 +848,7 @@ function KoobonePlugin:_do_download_comic(vol, force_redownload)
     -- 如果强制重新下载，先清除旧缓存
     if force_redownload and self.download then
         pcall(function()
-            self_ref.download:delete_vol_cache(fmd, vol.file_md5)
+            self_ref.download:delete_vol_cache(vol, fmd, vol.file_md5)
         end)
     end
 

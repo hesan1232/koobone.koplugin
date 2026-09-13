@@ -154,8 +154,8 @@ local zh = {
     ["Upload failed:\n%1"] = "上传失败:\n%1",
     ["Upload failed: missing volume info"] = "上传失败：卷信息缺失",
     ["Upload failed: network module not ready"] = "上传失败：网络模块未就绪",
-    ["Pre-download chapters count"] = "预下载章节数",
-    ["Pre-download N chapters while reading (0 = off)"] = "阅读时提前下载后 N 章 (0 表示不预下载)",
+    ["Pre-download chapters count"] = "预下载卷数",
+    ["Pre-download N chapters while reading (0 = off)"] = "阅读时提前下载后 N 卷 (0 表示不预下载)",
     ["Pre-download settings saved"] = "预下载设置已保存",
 
     -- ===== 缓存管理 =====
@@ -184,7 +184,7 @@ local zh = {
     ["About"] = "关于",
     ["Save only"] = "仅保存",
     ["Test error: "] = "测试异常: ",
-    ["Pre-download chapters"] = "预下载章节数",
+    ["Pre-download chapters"] = "预下载卷数",
 }
 
 -- 检测当前 KOReader 语言设置

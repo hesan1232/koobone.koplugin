@@ -5,7 +5,7 @@ local state = require("koobone.state")
 -- ============================================================
 -- 对齐 fanqie 两级缓存架构：
 --   书架（顶层视图） = series_list.php  → 系列列表（系列=漫画本体）
---   目录（点进系列） = vol_list.php?sid= → 该系列的卷列表（卷=章节）
+--   系列目录（点进系列） = vol_list.php?sid= → 该系列的卷列表（卷=单册）
 -- ============================================================
 
 -- L2: 系列列表内存缓存（书架主数据源，进程生命周期内常驻）
@@ -346,7 +346,7 @@ function Bookshelf:clearShelfCache()
     clear_shelf_file_cache(self)
     -- 衍生缓存同步清理
     state.invalidateDirectoryCache()
-    state.invalidateDownloadedChapters()
+    state.invalidateDownloadedVols()
     self.vols = {}
     self.dirty = true
     Log.info("Bookshelf.clearShelfCache: 三层缓存已清理")
@@ -421,12 +421,59 @@ function Bookshelf:refresh(force)
     save_shelf_cache(self, raw_series)
     -- state 层同步（供 shelf_view、download 等模块快速查）
     state.setShelfVols(raw_series)
-    -- 目录缓存、章节索引缓存（书架刷新后可能系列结构改变）
+    -- 目录缓存、卷索引缓存（书架刷新后可能系结构改变）
     state.invalidateDirectoryCache()
-    state.invalidateDownloadedChapters()
+    state.invalidateDownloadedVols()
     SERIES_VOLS_MEM = {}  -- 目录缓存全部失效
     Log.info("Bookshelf:refresh 完成, 共", #raw_series, "系列")
-    return raw_series, nil
+
+    -- ========================================================
+    -- 预拉全局 vol_list（在子进程里执行，把数据带回父进程做 prefill）
+    -- 目的：用户点进任何系列时 L1/L2 直接命中，0 延迟秒开
+    -- 设计：失败不影响主流程，用户点目录时仍能走 L4 原路径
+    -- 注意：refresh 在 Async.run 子进程里执行，对 SERIES_VOLS_MEM 的修改不会反映到父进程
+    --       所以这里只拉取数据，由父进程的 on_done 回调调用 _prefill_series_vols
+    --       Async.run 的 child_entry 只捕获第一个返回值，所以用复合 table 打包
+    --       _raw 字段未被使用且会增大 JSON 体积，strip 掉减轻跨进程传递开销
+    -- ========================================================
+    local all_vols_prefetch = nil
+    if self.client and self.client.get_vol_list then
+        local ok_prefetch, vols_or_err = pcall(function()
+            return self.client:get_vol_list({
+                sort = sort_key,
+                limit = 200,
+                -- 不传 sid/sna：触发全局查询，拉取用户全部作品
+            })
+        end)
+        if ok_prefetch and type(vols_or_err) == "table" and #vols_or_err > 0 then
+            -- strip _raw 字段，减轻跨进程 JSON 传递体积
+            all_vols_prefetch = {}
+            for _, v in ipairs(vols_or_err) do
+                local stripped = {}
+                for k, val in pairs(v) do
+                    if k ~= "_raw" then stripped[k] = val end
+                end
+                table.insert(all_vols_prefetch, stripped)
+            end
+            Log.info("[Bookshelf:refresh] 预拉全局 vol_list 成功, 共 " .. #all_vols_prefetch .. " 卷")
+        elseif not ok_prefetch then
+            Log.warn("[Bookshelf:refresh] 预拉全局 vol_list 失败（不影响主流程）:", tostring(vols_or_err))
+        else
+            Log.debug("[Bookshelf:refresh] 预拉全局 vol_list 返回空")
+        end
+    end
+
+    -- 返回复合 table：series_list 兼容旧调用方（truthy 检查），all_vols 供父进程 prefill
+    -- 父进程 on_done 里检查 result.all_vols 并调用 _prefill_series_vols
+    -- 同样 strip series 的 _raw 字段
+    local series_for_return = raw_series
+    for _, s in ipairs(series_for_return) do
+        s._raw = nil
+    end
+    return {
+        series = series_for_return,
+        all_vols = all_vols_prefetch,
+    }, nil
 end
 
 function Bookshelf:load_local_cache()
@@ -541,7 +588,7 @@ function Bookshelf:get_series_vols(series_id, opts)
         return {}
     end
     local sid = tostring(series_id)
-    -- 卷目录排序独立：永远按卷序号升序（漫画章节顺序）
+    -- 卷目录排序独立：永远按卷序号升序（漫画卷顺序）
     -- 书架 sort_key（self.settings:get_shelf_sort()）只影响系列列表，不影响卷目录
     -- 这样用户书架按 time_update 最近阅读排，进去目录依然是 第1卷→第2卷→... 正确顺序
 
@@ -667,8 +714,80 @@ function Bookshelf:get_series_vols(series_id, opts)
     return self:_sort_vols_catalog(result)
 end
 
+--- 全局 vol_list 预填各系列卷目录缓存
+-- 在 bookshelf:refresh 成功后并行调用，把全部卷按 vol_series group 到各系列缓存
+-- 用户点目录时 L1/L2 直接命中，0 延迟秒开
+-- @param all_vols 全局 vol_list 返回的卷数组（normalize 后）
+-- @param series_list_ref 系列列表引用（用于校验 sid 命中；可选，nil 时按 vol 自身字段 group）
+function Bookshelf:_prefill_series_vols(all_vols, series_list_ref)
+    if not all_vols or #all_vols == 0 then
+        Log.debug("[KoobonePrefill] all_vols 为空，跳过预填")
+        return 0
+    end
+
+    -- 构造 sid 集合，便于后续校验 group key 命中真实系列
+    local valid_sids = {}
+    if series_list_ref then
+        for _, s in ipairs(series_list_ref) do
+            local sid = tostring(s.id or "")
+            if sid ~= "" then valid_sids[sid] = true end
+        end
+    end
+
+    -- group by series_id（vol 已被 normalize_vol_item 注入 series_id 字段）
+    local groups = {}
+    local orphan_vols = {}
+    for _, v in ipairs(all_vols) do
+        local sid = tostring(v.series_id or v.series or "")
+        -- 跟 normalize_vol_item 的 fallback 一致：series_id 空 → series 名
+        -- 但 vol 的 series_id 已经在 normalize 阶段做了 fallback，这里只是兜底
+        if sid == "" then
+            sid = "__fmd__:" .. tostring(v.file_md5 or v.fmd or "unknown")
+            table.insert(orphan_vols, v)
+        else
+            -- 如果传入了 series_list_ref，校验 sid 是否命中真实系列
+            -- 不命中也保留（可能是新系列或服务端数据延迟），只是日志提示
+            if series_list_ref and not valid_sids[sid] then
+                Log.debug("[KoobonePrefill] group sid 未命中 series_list: " .. sid)
+            end
+        end
+        if not groups[sid] then groups[sid] = {} end
+        table.insert(groups[sid], v)
+    end
+
+    local now = os.time()
+    local count = 0
+    for sid, vols in pairs(groups) do
+        -- 强制注入 series_id，跟 get_series_vols 的 [bookshelf.lua:638] 行为对齐
+        -- 避免 is_vol_downloaded / 预下载 key 错位
+        for _, v in ipairs(vols) do
+            v.series_id = sid
+        end
+        -- 写 L1（UNSORTED，排序在 get_series_vols 返回前做）
+        SERIES_VOLS_MEM[sid] = { vols = vols, ts = now }
+        SERIES_VOLS_DIRTY[sid] = false
+        -- 写 L2 state 层（目录缓存，TTL 24h）
+        state.setDirectoryCache(sid, vols)
+        count = count + 1
+        Log.debug("[KoobonePrefill] 预填 series=" .. sid .. " vols=" .. #vols)
+    end
+
+    -- 孤儿卷（无 series_id 也无 series 名）：按 __fmd__:<fmd> 单独存，避免丢失
+    for _, v in ipairs(orphan_vols) do
+        local sid = "__fmd__:" .. tostring(v.file_md5 or v.fmd or "unknown")
+        if not groups[sid] then
+            SERIES_VOLS_MEM[sid] = { vols = { v }, ts = now }
+            state.setDirectoryCache(sid, { v })
+            count = count + 1
+        end
+    end
+
+    Log.info("[KoobonePrefill] 预填完成, 系列数=" .. count .. " 总卷数=" .. #all_vols)
+    return count
+end
+
 -- 内部：卷目录排序（独立于书架排序，只用于 get_series_vols 返回前）
--- 规则：永远按卷序号（vol_snumber）升序，代表漫画章节顺序 第1卷→第2卷...
+-- 规则：永远按卷序号（vol_snumber）升序，代表漫画卷顺序 第1卷→第2卷...
 --       time_update 不参与排序——用户明确："time_update时间最新代表当前阅读到这本书"，只用于⭐标记，不参与卷目录排序
 --       无 vol_snumber 时 fallback 到卷名称（title/vol_name）字典序，保证稳定
 function Bookshelf:_sort_vols_catalog(vols)
@@ -1125,27 +1244,27 @@ function Bookshelf:is_vol_downloaded(vol)
     if not series_key or series_key == "" then
         series_key = "__fmd__:" .. fmd
     end
-    local downloaded_map = state.getDownloadedChapters(series_key)
+    local downloaded_map = state.getDownloadedVols(series_key)
 
     if downloaded_map and downloaded_map[fmd] ~= nil then
         return downloaded_map[fmd] == true or downloaded_map[fmd] == 1
     end
 
-    local function check_one(target_fmd, file_md5_override)
-        local real_fmd = target_fmd or ""
+    local function check_one(target_vol, target_fmd, target_file_md5)
+        local real_fmd = tostring(target_fmd or "")
         if real_fmd == "" then return false end
-        local epub_name = (file_md5_override and tostring(file_md5_override) or real_fmd) .. ".epub"
-        local epub_path = H.join_path(epub_dir, epub_name)
+        -- 走公共解析函数：优先新命名，其次旧命名兼容
+        local epub_path = H.resolve_epub_path(epub_dir, target_vol, real_fmd, target_file_md5)
         if not H.file_exists(epub_path) then return false end
         local sz = H.file_size and H.file_size(epub_path) or 0
         return sz and sz > 1024
     end
 
-    local current_result = check_one(fmd, vol.file_md5)
+    local current_result = check_one(vol, fmd, vol.file_md5)
 
     if downloaded_map then
         downloaded_map[fmd] = current_result and true or false
-        state.setDownloadedChapters(series_key, downloaded_map)
+        state.setDownloadedVols(series_key, downloaded_map)
     else
         local new_map = {}
         new_map[fmd] = current_result and true or false
@@ -1157,12 +1276,12 @@ function Bookshelf:is_vol_downloaded(vol)
                 for _, v in ipairs(cache.vols) do
                     local vfmd = tostring(v.file_md5 or v.fmd or "")
                     if vfmd ~= "" and new_map[vfmd] == nil then
-                        new_map[vfmd] = check_one(vfmd, v.file_md5) and true or false
+                        new_map[vfmd] = check_one(v, vfmd, v.file_md5) and true or false
                     end
                 end
             end
         end
-        state.setDownloadedChapters(series_key, new_map)
+        state.setDownloadedVols(series_key, new_map)
     end
     return current_result
 end
@@ -1176,10 +1295,10 @@ function Bookshelf:markVolDownloaded(vol, flag)
     if not series_key or series_key == "" then
         series_key = "__fmd__:" .. fmd
     end
-    local map = state.getDownloadedChapters(series_key)
+    local map = state.getDownloadedVols(series_key)
     if not map then map = {} end
     map[fmd] = flag and true or false
-    state.setDownloadedChapters(series_key, map)
+    state.setDownloadedVols(series_key, map)
     Log.debug("markVolDownloaded: fmd=", fmd, "flag=", flag, "series=", series_key)
 end
 

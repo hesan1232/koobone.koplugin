@@ -56,7 +56,7 @@ local state = require("koobone.state")
 
 -- 修复: 此前误用 require("ui/async")，但 KOReader 并无此标准模块，
 -- 导致 ok_Async=false / Async=nil，所有 Async.run(...) 调用都会
--- "attempt to index a nil value" 直接闪退（开始阅读/章节目录/刷新书架等）。
+-- "attempt to index a nil value" 直接闪退（开始阅读/卷目录/刷新书架等）。
 -- 正确的异步模块是项目自带的 koobone.async（与 main.lua/download.lua/progress.lua 一致）。
 local ok_Async, Async = pcall(require, "koobone.async")
 
@@ -696,15 +696,21 @@ local function refresh_shelf(opts, menu)
     if ok_UIManager then pcall(function() UIManager:forceRePaint() end) end
     if not ok_Async then
         do_close_busy()
-        local ok, err = pcall(function()
+        local ok, result_or_err = pcall(function()
             return plugin_ref.bookshelf and plugin_ref.bookshelf:refresh(true)
         end)
         if not ok then
             UIManager:show(InfoMessage:new{
-                text = T(_t("刷新失败:\n%1"), tostring(err)),
+                text = T(_t("刷新失败:\n%1"), tostring(result_or_err)),
                 timeout = 3,
             })
             return
+        end
+        -- 同步模式：result_or_err 是 refresh 的复合 table，做 prefill
+        if type(result_or_err) == "table" and result_or_err.all_vols then
+            pcall(function()
+                plugin_ref.bookshelf:_prefill_series_vols(result_or_err.all_vols, result_or_err.series)
+            end)
         end
         refresh_current(menu)
         return
@@ -731,6 +737,12 @@ local function refresh_shelf(opts, menu)
                     timeout = 3,
                 })
                 return
+            end
+            -- 预拉全局 vol_list 数据已通过子进程返回，在父进程做 prefill
+            if type(result) == "table" and result.all_vols then
+                pcall(function()
+                    plugin_ref.bookshelf:_prefill_series_vols(result.all_vols, result.series)
+                end)
             end
             -- 成功：动态更新当前菜单内容（保持页码/焦点）
             refresh_current(menu)
@@ -807,7 +819,7 @@ end
 -- 前向声明：local function 顺序加载依赖，show_series_action_dialog 内部会调 show_series_chapter_dialog
 local show_series_chapter_dialog
 -- 系列 Action 对话框（fanqie 风格）
--- 点击或长按系列后显示：开始阅读 / 章节目录 / 下载全部未缓存 / 刷新系列 / 取消
+-- 点击或长按系列后显示：开始阅读 / 卷目录 / 下载全部未缓存 / 刷新系列 / 取消
 show_series_action_dialog = function(opts, menu, series)
     if not (ok_UIManager and ok_ButtonDialog) then return end
     local plugin = opts and opts.plugin
@@ -875,7 +887,7 @@ show_series_action_dialog = function(opts, menu, series)
                 { text = _t("开始阅读"), callback = do_start_reading },
             },
             {
-                { text = _t("章节目录"), callback = function()
+                { text = _t("卷目录"), callback = function()
                     close_dlg()
                     show_series_chapter_dialog(opts, menu, series)
                 end },
@@ -906,7 +918,7 @@ show_series_action_dialog = function(opts, menu, series)
     UIManager:show(dlg)
 end
 
--- 系列章节目录：用 ShelfView_update 切到该系列的"卷目录页面"视图
+-- 系列卷目录：用 ShelfView_update 切到该系列的"卷目录页面"视图
 --   与 fanqie 风格一致：目录是完整页面（不是弹窗），左上角按钮返回书架主页。
 --   卷条目带 ⭐ 当前/✓ 已缓存/阅读进度 N/M 标识（build_items 卷视图分支负责）。
 -- 关键修复：用 peek_series_vols 只查缓存（L1/L2/L3）不触发 API，避免缓存 miss 时
@@ -1339,20 +1351,26 @@ delete_local_epub = function(opts, menu, vol)
     if not (ok_UIManager and ok_InfoMessage) then return end
     local plugin = opts and opts.plugin
     if not plugin then return end
-    local epub_dir = H.get_epub_dir()
     local fmd = tostring(vol.file_md5 or vol.fmd or "")
-    local epub_path = H.join_path(epub_dir, fmd .. ".epub")
-    if H.file_exists(epub_path) then
-        local ok_rm, err_rm = pcall(function() os.remove(epub_path) end)
-        if not ok_rm then
-            UIManager:show(InfoMessage:new{
-                text = T(_t("删除失败:\n%1"), tostring(err_rm)),
-                timeout = 3,
-            })
-            return
-        end
+    -- 走 download 模块统一接口：同时清理新命名（系列子目录）和旧命名（根目录）残留
+    local removed = false
+    if plugin.download and plugin.download.delete_vol_cache then
+        removed = pcall(function() return plugin.download:delete_vol_cache(vol, fmd, vol.file_md5) end)
     end
-    -- 章节索引缓存实时标记：已删除
+    if not removed then
+        -- 兜底：直接走 helper 的路径生成函数，清理新+旧两个位置
+        local epub_dir = H.get_epub_dir()
+        local subdir = H.epub_subdir_for_vol(vol)
+        local new_full_dir = epub_dir
+        if subdir and subdir ~= "" then
+            new_full_dir = H.join_path(epub_dir, subdir)
+        end
+        local new_path = H.join_path(new_full_dir, H.epub_filename_for_vol(vol, fmd, vol.file_md5))
+        local legacy_path = H.join_path(epub_dir, H.epub_legacy_filename(fmd, vol.file_md5))
+        pcall(function() os.remove(new_path) end)
+        pcall(function() os.remove(legacy_path) end)
+    end
+    -- 卷下载索引缓存实时标记：已删除
     if plugin.bookshelf then
         pcall(function() plugin.bookshelf:markVolDownloaded(vol, false) end)
     end
@@ -1842,7 +1860,12 @@ function ShelfView_show(opts_in)
         else
             -- 书架视图：刷新书架数据
             if force_api then
-                pcall(function() rbookshelf:refresh(true) end)
+                local ok_rf, result_rf = pcall(function() return rbookshelf:refresh(true) end)
+                if ok_rf and type(result_rf) == "table" and result_rf.all_vols then
+                    pcall(function()
+                        rbookshelf:_prefill_series_vols(result_rf.all_vols, result_rf.series)
+                    end)
+                end
             end
             refresh_current(menu_to_refresh)
         end

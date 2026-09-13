@@ -30,17 +30,49 @@ function Download:new(settings, client, bookshelf)
     return setmetatable(obj, self)
 end
 
-function Download:_cache_key(fmd, file_md5)
-    local md5 = file_md5 and tostring(file_md5) or ""
-    if md5 ~= "" then
-        return H.trim(md5)
+-- 文件名生成委托给 helper，确保 download/bookshelf/shelf_view 使用统一规则
+function Download:_cache_key(vol, fmd, file_md5)
+    -- 接受两种调用形式:
+    --   _cache_key(vol, fmd, file_md5)  推荐，含 vol 时用 vol_name 命名
+    --   _cache_key(fmd, file_md5)       兼容旧调用（vol 缺失，回退到纯 file_md5）
+    if type(vol) ~= "table" then
+        -- 旧调用形式: _cache_key(fmd, file_md5)
+        file_md5 = fmd
+        fmd = vol
+        vol = nil
     end
-    return H.trim(tostring(fmd or "unknown"))
+    local name = H.epub_filename_for_vol(vol, fmd, file_md5)
+    -- 去掉 .epub 后缀，仅返回 key
+    return name:gsub("%.epub$", "")
 end
 
-function Download:_epub_path(fmd, file_md5)
-    local key = self:_cache_key(fmd, file_md5)
-    return H.join_path(self.EPUB_CACHE_DIR, key .. ".epub")
+function Download:_epub_path(vol, fmd, file_md5)
+    -- 兼容旧调用形式: _epub_path(fmd, file_md5)
+    if type(vol) ~= "table" then
+        file_md5 = fmd
+        fmd = vol
+        vol = nil
+    end
+    -- 新命名路径（含系列子目录）
+    local subdir = H.epub_subdir_for_vol(vol)
+    local full_dir = self.EPUB_CACHE_DIR
+    if subdir and subdir ~= "" then
+        full_dir = H.join_path(self.EPUB_CACHE_DIR, subdir)
+    end
+    local name = H.epub_filename_for_vol(vol, fmd, file_md5)
+    return H.join_path(full_dir, name)
+end
+
+--- 旧命名路径（纯 file_md5，在 epub_dir 根目录），仅用于兼容查找/删除
+function Download:_epub_legacy_path(fmd, file_md5)
+    local name = H.epub_legacy_filename(fmd, file_md5)
+    return H.join_path(self.EPUB_CACHE_DIR, name)
+end
+
+--- 解析已存在的 EPUB 路径：优先新命名（按系列分子目录），其次旧命名（根目录，命中时自动迁移）
+-- 若都不存在，确保新路径父目录存在，返回新路径供调用方写入下载文件
+function Download:_resolve_epub_path(vol, fmd, file_md5)
+    return H.resolve_epub_path(self.EPUB_CACHE_DIR, vol, fmd, file_md5)
 end
 
 function Download:_lru_cleanup()
@@ -64,7 +96,8 @@ end
 function Download:_download_epub_file(vol, file_url, expected_size, file_md5)
     local fmd = tostring(vol.file_md5 or vol.fmd or "unknown")
     H.make_dir(self.EPUB_CACHE_DIR)
-    local epub_path = self:_epub_path(fmd, file_md5)
+    -- 解析已存在路径（自动迁移旧命名到新命名）
+    local epub_path = self:_resolve_epub_path(vol, fmd, file_md5)
     expected_size = tonumber(expected_size) or 0
 
     if H.file_exists(epub_path) then
@@ -166,7 +199,8 @@ end
 function Download:_download_epub_file_with_progress(vol, file_url, expected_size, file_md5, progress_callback, cancel_check)
     local fmd = tostring(vol.file_md5 or vol.fmd or "unknown")
     H.make_dir(self.EPUB_CACHE_DIR)
-    local epub_path = self:_epub_path(fmd, file_md5)
+    -- 解析已存在路径（自动迁移旧命名到新命名）
+    local epub_path = self:_resolve_epub_path(vol, fmd, file_md5)
     expected_size = tonumber(expected_size) or 0
 
     -- 优化: 不再单独发送 HEAD 请求获取文件大小
@@ -324,7 +358,7 @@ function Download:ensure_epub(fmd_or_vol, progress_callback, ipc_opts)
     local cancel_file = ipc_opts.cancel_file
 
     local file_md5 = vol and vol.file_md5 or fmd_str
-    local epub_path = self:_epub_path(fmd_str, file_md5)
+    local epub_path = self:_resolve_epub_path(vol, fmd_str, file_md5)
 
     -- 已下载缓存检查
     if H.file_exists(epub_path) then
@@ -383,7 +417,7 @@ function Download:download_epub_file(vol, progress_dialog, plugin_ref, ipc_opts)
     local cancel_file = ipc_opts.cancel_file
 
     -- 原子性检查1: 是否已下载（避免重复下载已完成的卷）
-    local epub_path = self:_epub_path(fmd, vol.file_md5)
+    local epub_path = self:_resolve_epub_path(vol, fmd, vol.file_md5)
     if H.file_exists(epub_path) then
         local cur_size = H.file_size(epub_path)
         if cur_size and cur_size > 1024 then
@@ -518,15 +552,38 @@ function Download:download_epub_file(vol, progress_dialog, plugin_ref, ipc_opts)
     return epub_path, nil
 end
 
-function Download:delete_vol_cache(fmd, file_md5)
-    if not fmd and not file_md5 then
+--- 删除卷缓存的 EPUB 文件
+-- 接受三种调用形式:
+--   delete_vol_cache(vol, fmd, file_md5)  推荐，会同时删除新+旧命名
+--   delete_vol_cache(fmd, file_md5)       兼容旧调用
+-- 兼容旧命名残留文件，确保切换命名规则后旧文件也能被清理
+function Download:delete_vol_cache(vol_or_fmd, fmd_arg, file_md5_arg)
+    local vol, fmd, file_md5
+    if type(vol_or_fmd) == "table" then
+        vol = vol_or_fmd
+        fmd = tostring(fmd_arg or vol.file_md5 or vol.fmd or "")
+        file_md5 = file_md5_arg or vol.file_md5 or fmd
+    else
+        -- 旧调用形式: delete_vol_cache(fmd, file_md5)
+        fmd = tostring(vol_or_fmd or "")
+        file_md5 = fmd_arg or fmd
+        vol = nil
+    end
+    if fmd == "" and (not file_md5 or file_md5 == "") then
         return false
     end
     local ok, err = pcall(function()
-        local epub_path = self:_epub_path(fmd, file_md5)
-        if H.file_exists(epub_path) then
-            Log.info("[KooboneDownload] 删除卷缓存 EPUB:", epub_path)
-            os.remove(epub_path)
+        -- 新命名路径
+        local new_path = self:_epub_path(vol, fmd, file_md5)
+        if H.file_exists(new_path) then
+            Log.info("[KooboneDownload] 删除卷缓存 EPUB(新命名):", new_path)
+            os.remove(new_path)
+        end
+        -- 旧命名路径（兼容残留）
+        local legacy_path = self:_epub_legacy_path(fmd, file_md5)
+        if legacy_path ~= new_path and H.file_exists(legacy_path) then
+            Log.info("[KooboneDownload] 删除卷缓存 EPUB(旧命名):", legacy_path)
+            os.remove(legacy_path)
         end
     end)
     if not ok then
@@ -553,7 +610,7 @@ function Download:is_downloaded(vol)
     if not vol then return false end
     local fmd = tostring(vol.file_md5 or vol.fmd or "")
     if fmd == "" then return false end
-    local epub_path = self:_epub_path(fmd, vol.file_md5)
+    local epub_path = self:_resolve_epub_path(vol, fmd, vol.file_md5)
     if H.file_exists(epub_path) then
         if self.bookshelf then
             pcall(function()
