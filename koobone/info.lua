@@ -11,7 +11,7 @@ local _ = ok_gettext and gettext or function(text) return text end
 
 return {
     -- 版本号（唯一来源，main.lua 和 _meta.lua 都读这里）
-    version = "0.2.0",
+    version = "1.2.1",
 
     -- 插件描述（_meta.lua 的 description 字段使用）
     description = _("Koobone 漫画资源库插件，支持书架浏览、批量下载、EPUB 缓存、进度云端同步，适配墨水屏黑白显示。"),

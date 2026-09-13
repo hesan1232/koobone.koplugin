@@ -121,6 +121,18 @@ API Key 通过 `X-KB-INFO` 请求头直传服务端鉴权，无需配置 Cookie/
 
 ## 更新日志
 
+### v1.2.1（2026-09-13）
+
+**新增：**
+
+- **全局卷目录预填** — `bookshelf:refresh` 拉取系列列表时并行预拉全局 `vol_list.php`，按 `vol_series` 字段分组写入 L1 内存缓存 + L2 state 目录缓存。用户点进任何系列时直接命中缓存秒开，无需等待 API 返回
+- **EPUB 文件命名规范化** — 下载文件改为 `{系列名}/{vol_name}.epub` 目录结构，同一系列的卷集中在一个文件夹下，旧版 `{file_md5}.epub` 文件自动 rename 迁移到新位置
+
+**重构：**
+
+- **术语统一** — 代码标识符与 UI 文案统一改为"卷"概念：`chapter_index_cache` → `vol_index_cache`，`getDownloadedChapters` → `getDownloadedVols`，UI 文案"章节目录"→"卷目录"、"预下载章节数"→"预下载卷数"
+- **认证方式调整** — 完全改为 API Key 直传鉴权（`X-KB-INFO` 请求头），移除 Cookie/Session 配置，README 同步更新获取步骤
+
 ### v0.2.0（2026-08-10）
 
 **修复：**
