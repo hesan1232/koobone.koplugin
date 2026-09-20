@@ -9,6 +9,7 @@ local M = {
 }
 
 local H = require("koobone.helper")
+local comic_detect = require("koobone.comic_detect")
 
 -- 检查插件是否被禁用
 M.is_plugin_disabled = function()
@@ -52,16 +53,60 @@ local function patchReaderUI()
     -- 保存原始的 showReader 方法
     if not ReaderUI._koobone_original_showReader then
         ReaderUI._koobone_original_showReader = ReaderUI.showReader
-        ReaderUI.showReader = function(self, file)
-            -- 调用原始方法
-            local result = ReaderUI._koobone_original_showReader(self, file)
+        ReaderUI.showReader = function(self, file, ...)
+            -- 解析 vararg:provider / seamless / is_provider_forced / after_open_callback
+            local provider, seamless, is_provider_forced, after_open_callback = ...
 
-            -- 如果是 koobone 漫画，自动设置样式调整
+            -- 如果 provider 已被其他插件强制（如 MangaFit），尊重它，直接透传
+            if is_provider_forced then
+                return ReaderUI._koobone_original_showReader(self, file, ...)
+            end
+
+            -- 前处理：通用漫画识别（仅对 EPUB 且 provider 未强制时）
+            local ext = comic_detect.get_extension(file)
+            local is_epub = ext == "epub" or ext == "epub3"
+            local has_mangafit = comic_detect.has_mangafit()
+            local comic_detected = false
+
+            if is_epub then
+                if is_koobone_path(file) then
+                    -- Koobone 下载的必定是漫画
+                    comic_detected = true
+                else
+                    -- 通用识别：扫描 ZIP 中心目录统计图片占比
+                    local class = comic_detect.scan(file)
+                    comic_detected = (class == "comic")
+                end
+            end
+
+            if comic_detected then
+                if has_mangafit then
+                    -- 有 MangaFit：透传，让 MangaFit 接管识别 + provider 选择 + 裁边
+                    return ReaderUI._koobone_original_showReader(self, file, ...)
+                else
+                    -- 无 MangaFit：Koobone 自己选官方 MuPDF provider（至少分页显示，无裁边）
+                    local mupdf = comic_detect.find_mupdf_provider(file)
+                    if mupdf then
+                        return ReaderUI._koobone_original_showReader(self, file, mupdf, seamless, true, after_open_callback)
+                    end
+                end
+            end
+
+            -- 识别为文字或无法判定：透传 + 后处理 CSS 注入（仅 koobone 路径）
+            local result = ReaderUI._koobone_original_showReader(self, file, ...)
+
             if is_koobone_path(file) then
                 local UIManager = require("ui/uimanager")
                 -- 等待 ReaderUI 和 styletweak 初始化完成
                 UIManager:scheduleIn(2.0, function()
                     local ui = self
+                    -- 校验当前文档仍是这次打开的那本（防止 2 秒内切到别的书）
+                    local current = ui and ui.document
+                    local current_path = current and (current.file or current.path)
+                    if current_path ~= file then return end
+                    -- MangaFit 已接管分页漫画时跳过 CSS 注入（MuPDF 模式下 styletweak 无效）
+                    local fit = ui and ui.mangafit
+                    if fit and fit.isPagedDocument and fit:isPagedDocument() then return end
                     if ui and ui.styletweak then
                         local st = ui.styletweak
                         -- 设置书籍样式调整

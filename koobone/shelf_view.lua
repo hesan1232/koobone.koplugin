@@ -596,13 +596,19 @@ local function trigger_cover_download(opts, menu)
         Log.debug("[KooboneCover] 无待下载封面（可能都已缓存或列表为空）")
         return
     end
+    -- 后台子进程不可用时跳过自动封面下载，避免阻塞 KOReader 界面
+    if not (ok_Async and Async and Async.is_available and Async.is_available()) then
+        Log.warn("[KooboneCover] 后台子进程不可用，跳过自动封面缓存以免阻塞 KOReader")
+        return
+    end
 
     -- 逐个下载：每次下载一个封面后 yield 给 UI，避免长时间阻塞
     local idx = 1
+    local last_refresh = 0
     local function download_next()
         if not menu or menu._koobone_closed then return end
         if idx > #pending then
-            -- 全部下载完成：最后再刷新一次兜底（避免某些成功下载因 yield 被跳过）
+            -- 全部下载完成：最后再刷新一次兜底（避免某些成功下载因节流被跳过）
             pcall(function() refresh_current(menu) end)
             return
         end
@@ -611,50 +617,52 @@ local function trigger_cover_download(opts, menu)
         local covers_dir = H.get_covers_dir()
         H.make_dir(covers_dir)
         local cover_path = H.join_path(covers_dir, H.cover_filename_for(item.fmd))
-        local need_refresh = false
         if not H.file_exists(cover_path) then
             Log.debug("[KooboneCover] 开始下载 fmd=", tostring(item.fmd), "url=", tostring(item.url))
+            -- 把单张下载放到子进程，避免 SSL 握手阻塞 UI 线程
             -- 使用 bookshelf:download_cover_file（SSL bypass + 正确 headers）
-            -- H.download_file 不禁用 SSL 验证，在 Kindle 上会失败
-            local dl_ok, dl_ret, dl_err = pcall(function()
-                return bookshelf:download_cover_file(item.url, cover_path)
-            end)
-            if dl_ok and dl_ret and H.file_exists(cover_path) then
-                bookshelf.covers[item.fmd] = cover_path
-                Log.debug("[KooboneCover] 下载成功 fmd=", tostring(item.fmd))
-                -- 修复: 每成功下载一个封面就立即刷新当前页（只刷新当前显示页的 item，
-                -- 不触发整屏闪烁、不触发翻页重绘），用户可以看到封面逐张出现，
-                -- 而不是要等全部下完或下次打开书架才显示。
-                -- 同时符合 project_memory "only refresh when cover download succeeds"。
-                need_refresh = true
-            else
-                -- 下载失败：记录原因，方便排查（SSL/Referer/网络）
-                local reason = "未知"
-                if not dl_ok then
-                    reason = "pcall异常: " .. tostring(dl_ret)
-                elseif not dl_ret then
-                    reason = tostring(dl_err or "download_cover_file返回false")
-                elseif not H.file_exists(cover_path) then
-                    reason = "文件不存在(可能HTTP错误或SSL失败): " .. tostring(dl_err or "")
+            Async.run(function()
+                local success, reason = bookshelf:download_cover_file(item.url, cover_path)
+                return { success = success, reason = reason }
+            end, function(ok, result, err)
+                if menu._koobone_closed then return end
+                if ok and result and result.success and H.file_exists(cover_path) then
+                    bookshelf.covers[item.fmd] = cover_path
+                    Log.debug("[KooboneCover] 下载成功 fmd=", tostring(item.fmd))
+                    -- 2 秒节流刷新，避免 50 张封面刷 50 次水墨屏闪烁
+                    local now = os.time()
+                    if now - last_refresh >= 2 then
+                        last_refresh = now
+                        pcall(function() refresh_current(menu) end)
+                    end
+                else
+                    -- 下载失败：记录原因，方便排查（SSL/Referer/网络）
+                    local reason = (result and result.reason) or err or "未知"
+                    Log.warn("[KooboneCover] 封面下载失败 fmd=" .. tostring(item.fmd)
+                        .. " url=" .. tostring(item.url)
+                        .. " reason=" .. tostring(reason))
                 end
-                Log.warn("[Koobone] 系列封面下载失败 fmd=" .. tostring(item.fmd)
-                    .. " url=" .. tostring(item.url)
-                    .. " reason=" .. reason)
-            end
+                -- 下载完成后再调度下一个，给 UI 喘息
+                if not menu._koobone_closed and ok_UIManager then
+                    UIManager:scheduleIn(0.05, download_next)
+                end
+            end, { timeout = 45, poll_interval = 0.3 })
+            return
         else
             -- 本地已有 → 回填内存缓存即可。如果内存里没有，说明是重启后首次加载，
             -- 这时也需要刷新一次让 ImageWidget 读取到本地 cover_path。
             if not bookshelf.covers[item.fmd] then
                 bookshelf.covers[item.fmd] = cover_path
-                need_refresh = true
+                local now = os.time()
+                if now - last_refresh >= 2 then
+                    last_refresh = now
+                    pcall(function() refresh_current(menu) end)
+                end
             end
-        end
-        if need_refresh then
-            pcall(function() refresh_current(menu) end)
         end
         -- 调度下一个下载（让 UI 有机会处理事件）
         if ok_UIManager then
-            UIManager:scheduleIn(0.01, download_next)
+            UIManager:scheduleIn(0.05, download_next)
         else
             download_next()
         end

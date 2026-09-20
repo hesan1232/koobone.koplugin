@@ -843,6 +843,11 @@ function KoobonePlugin:download_comic(vol, force)
 end
 
 function KoobonePlugin:_do_download_comic(vol, force_redownload)
+    -- 子进程不可用时拒绝下载，避免阻塞 UI 线程导致 KOReader 无响应
+    if not Async or not Async.is_available or not Async.is_available() then
+        self:showInfo(_("后台下载不可用，已停止缓存以防 KOReader 无响应"))
+        return
+    end
     local self_ref = self
     local fmd = tostring(vol.file_md5 or vol.fmd or "")
 
