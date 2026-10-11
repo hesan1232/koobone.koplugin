@@ -152,7 +152,7 @@ local KoobonePlugin = WidgetContainer:extend{
     name = "koobone",
     is_doc_only = false,
     fullname = Info and Info.fullname or _("Koobone 漫画"),
-    version = Info and Info.version or "1.5.0",
+    version = Info and Info.version or "1.5.1",
 }
 
 -- ════════════════════════════════════════════════════════════════════════════

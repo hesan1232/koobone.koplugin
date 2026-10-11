@@ -1,16 +1,16 @@
 {
-  "version": "1.5.0",
-  "name": "Koobone 漫画 1.5.0",
+  "version": "1.5.1",
+  "name": "Koobone 漫画 1.5.1",
   "channel": "stable",
   "package_type": "full",
-  "package_url": "https://github.com/hesan1232/koobone.koplugin/releases/download/v1.5.0/koobone.koplugin.zip",
+  "package_url": "https://github.com/hesan1232/koobone.koplugin/releases/download/v1.5.1/koobone.koplugin.zip",
   "package_urls": [
-    "https://github.com/hesan1232/koobone.koplugin/releases/download/v1.5.0/koobone.koplugin.zip",
-    "https://ghfast.top/https://github.com/hesan1232/koobone.koplugin/releases/download/v1.5.0/koobone.koplugin.zip",
-    "https://gh-proxy.com/https://github.com/hesan1232/koobone.koplugin/releases/download/v1.5.0/koobone.koplugin.zip",
-    "https://ghproxy.net/https://github.com/hesan1232/koobone.koplugin/releases/download/v1.5.0/koobone.koplugin.zip"
+    "https://github.com/hesan1232/koobone.koplugin/releases/download/v1.5.1/koobone.koplugin.zip",
+    "https://ghfast.top/https://github.com/hesan1232/koobone.koplugin/releases/download/v1.5.1/koobone.koplugin.zip",
+    "https://gh-proxy.com/https://github.com/hesan1232/koobone.koplugin/releases/download/v1.5.1/koobone.koplugin.zip",
+    "https://ghproxy.net/https://github.com/hesan1232/koobone.koplugin/releases/download/v1.5.1/koobone.koplugin.zip"
   ],
-  "size": 166427,
-  "sha256": "75b684b9bcc251b087357517c16cdea86d13c7579ad4e91654536fedd416a721",
-  "notes": "**新增：书架两级视图的「排序」与「搜索」**（交互参考「开源阅读」插件）\n\n- **排序**：系列列表（按最后阅读 / 更新时间 / 名称）与卷列表（按卷序 / 名称 / 更新时间）；\n  同一个键再点一次翻转**正序 / 倒序**，当前生效的键标 `✓`，按钮直接显示方向。\n- **搜索**：菜单内输入关键字（大小写不敏感子串，非正则）；系列匹配 **名称 + 作者**，\n  卷匹配 **卷名**；标题栏显示 `[关键字]`，留空 = 清除。\n- **两套排序互相独立**：书架按「更新时间」排**不会**打乱卷目录「第 1 卷 → 第 2 卷」的阅读顺序。\n- 切换视图（进系列 / 返回书架）会清空搜索关键字；无匹配时提示并**保留原列表**。\n- **顺带修复**：此前切换视图时**标题栏不刷新**（上游 `title_bar` 只在初始化 / `setTitle()`\n  时重建，直接改 `menu.title` 无效），现在会正确更新。"
+  "size": 170285,
+  "sha256": "2c93f731265480e13c1116c3bbdc4835fe2c4692e072a441e56fbddf309a593e",
+  "notes": "**修复在线更新 403 误报 + 下载镜像可手选**（设计参考 appstore.koplugin）\n\n- **检查更新失败不再只报最后一个错误**：所有清单地址（直连 + 镜像）逐个尝试，失败时\n  按**主机名**聚合报出 —— 直连被墙（连接重置）与镜像限流（HTTP 403）从此一眼可分。\n- **新增「下载镜像」菜单**：自动（默认）/ 仅直连 GitHub / 四个预设镜像 / 自定义前缀。\n  镜像站按 IP 限流，哪个能用完全取决于当时网络 —— 换一个常能解决「检查更新失败」。\n- **镜像偏好同时作用于清单检查与安装包下载**，下载内容仍强制校验 SHA-256，安装内容不受影响。\n- **修复：SHA-256 校验永远不通过的隐藏 bug** —— Lua 模式不支持 `{64}` 量词，\n  `^%x{64}$` 会把合法哈希全部拒掉（此前一直被网络层错误掩盖）；现改为长度 + `^%x+$` 校验。"
 }

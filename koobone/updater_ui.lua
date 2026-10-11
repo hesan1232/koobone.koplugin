@@ -18,7 +18,6 @@ local UIManager = require("ui/uimanager")
 local ConfirmBox = require("ui/widget/confirmbox")
 local ButtonDialog = require("ui/widget/buttondialog")
 local Device = require("device")
-
 local Async = require("koobone.async")
 local Updater = require("koobone.updater")
 local Log = require("koobone.logger")
@@ -47,10 +46,27 @@ local function save_prefs(plugin, value)
     plugin.settings:flush()
 end
 
+--- 把持久化的镜像选择解析成 updater 认的策略值。
+-- 必须定义在 get_updater 之前：Lua 的 local 函数只对**其后**的定义可见
+-- （模块级 local 函数不共享、先声明后使用）。
+local function resolve_mirror(p)
+    local m = p.mirror or "auto"
+    if m == "custom" then
+        local url = p.mirror_url
+        if type(url) == "string" and url:match("^https://") then
+            return url
+        end
+        return "auto"     -- 自定义地址坏了就退回自动，别让更新彻底瘫痪
+    end
+    return m
+end
+
 local function get_updater(plugin)
     if not plugin._updater then
         plugin._updater = Updater:new{ version = plugin.version }
     end
+    -- 镜像偏好每次现取：用户在菜单里改完立刻生效，不用等重建 updater
+    plugin._updater.mirror = resolve_mirror(prefs(plugin))
     return plugin._updater
 end
 
@@ -72,6 +88,48 @@ local function restart_label(mode)
     if mode == "auto" then return _("自动重启") end
     if mode == "never" then return _("稍后手动重启") end
     return _("询问是否重启")
+end
+
+-- ============================================================
+-- 下载镜像（参考 appstore.koplugin：镜像应由用户手选，而非只靠自动轮询）
+--
+-- 为什么：镜像站普遍按 IP 限流，哪个能用完全取决于用户当时的网络。
+-- 自动回退只能救「单个镜像挂了」；用户网络下所有预设镜像都被限时，
+-- 只有让用户换一个（或填自建镜像）才有出路。
+-- ============================================================
+
+local MIRROR_PRESETS = {
+    { id = "auto",   label = _("自动（直连优先，失败换镜像）") },
+    { id = "direct", label = _("仅直连 GitHub（不走第三方镜像）") },
+    { id = "https://gh-proxy.com/",  label = "gh-proxy.com" },
+    { id = "https://ghfast.top/",    label = "ghfast.top" },
+    { id = "https://ghproxy.net/",   label = "ghproxy.net" },
+    { id = "https://gh.ddlc.top/",   label = "gh.ddlc.top" },
+    { id = "custom", label = _("自定义镜像前缀…") },
+}
+
+local function mirror_label(plugin)
+    local p = prefs(plugin)
+    local m = p.mirror or "auto"
+    if m == "auto" then return _("自动") end
+    if m == "direct" then return _("仅直连") end
+    if m == "custom" then
+        local host = tostring(p.mirror_url or ""):match("^https://([^/]+)")
+        return host or _("自定义")
+    end
+    return tostring(m):match("^https://([^/]+)") or _("自动")
+end
+
+--- 自定义前缀校验：https + 有主机名 + 结尾补 /。与 appstore 同款防呆：
+--- 拒绝带空格 / userinfo / query 的东西，别把用户输入的垃圾拼进下载地址。
+local function normalize_mirror_url(value)
+    if type(value) ~= "string" then return nil end
+    value = value:gsub("%s", "")
+    if value == "" then return nil end
+    local host = value:match("^https://([^/]+)")
+    if not host or host == "" then return nil end
+    if value:sub(-1) ~= "/" then value = value .. "/" end
+    return value
 end
 
 --- 记录本次检查时间戳，供频率门限判断。必须在发起检查**之前**写，
@@ -384,6 +442,11 @@ function UI.menu_items(plugin)
             sub_item_table_func = function() return UI._frequency_items(plugin) end,
         },
         {
+            text = _("下载镜像 · ") .. mirror_label(plugin),
+            help_text = _("镜像站按 IP 限流，换一个常能解决「检查更新失败」；下载内容仍会校验 SHA-256。"),
+            sub_item_table_func = function() return UI._mirror_items(plugin) end,
+        },
+        {
             text = _("安装完成后 · ") .. restart_label(p.restart_mode),
             sub_item_table_func = function() return UI._restart_items(plugin) end,
         },
@@ -430,6 +493,65 @@ function UI._frequency_items(plugin)
         }
     end
     return rows
+end
+
+function UI._mirror_items(plugin)
+    local rows = {}
+    for _, preset in ipairs(MIRROR_PRESETS) do
+        rows[#rows + 1] = {
+            text = preset.label,
+            radio = true,
+            keep_menu_open = true,
+            checked_func = function()
+                return (prefs(plugin).mirror or "auto") == preset.id
+            end,
+            callback = (preset.id == "custom") and function()
+                UI._ask_custom_mirror(plugin)
+            end or function()
+                local np = prefs(plugin)
+                np.mirror = preset.id
+                save_prefs(plugin, np)
+            end,
+        }
+    end
+    return rows
+end
+
+--- 自定义镜像前缀输入框。懒加载 InputDialog（拖整条输入法依赖链，别放文件头）。
+function UI._ask_custom_mirror(plugin)
+    local InputDialog = require("ui/widget/inputdialog")
+    local p = prefs(plugin)
+    local dialog
+    dialog = InputDialog:new{
+        title = _("自定义镜像前缀"),
+        input = tostring(p.mirror_url or ""),
+        input_hint = "https://your-mirror.example.com/",
+        description = _("用法：前缀 + 完整 GitHub 地址（例如 https://mirror.example/https://github.com/...）。仅接受 https，结尾自动补 /；下载内容仍强制校验 SHA-256。"),
+        buttons = {
+            { {
+                text = _("取消"),
+                callback = function() UIManager:close(dialog) end,
+            } },
+            { {
+                text = _("保存"),
+                is_enter_default = true,
+                callback = function()
+                    local normalized = normalize_mirror_url(dialog:getInputText())
+                    UIManager:close(dialog)
+                    if not normalized then
+                        plugin:showInfo(_("前缀无效：必须是 https:// 开头、带主机名的地址。"))
+                        return
+                    end
+                    local np = prefs(plugin)
+                    np.mirror = "custom"
+                    np.mirror_url = normalized
+                    save_prefs(plugin, np)
+                end,
+            } },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
 end
 
 function UI._restart_items(plugin)

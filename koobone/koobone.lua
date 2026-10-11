@@ -43,7 +43,7 @@ end
 -- 构造鉴权头 X-KB-FROM：插件名/版本 + 设备型号
 -- 与 test.py 对齐："koobone.koplugin/1.0.0 (Kindle; Oasis2)"
 function Koobone.build_kb_from(version)
-    version = version or "1.5.0"
+    version = version or "1.5.1"
     return "koobone.koplugin/" .. tostring(version) .. " (" .. Koobone.device_model() .. ")"
 end
 

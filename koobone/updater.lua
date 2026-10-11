@@ -42,10 +42,14 @@ local MANIFEST_URLS = {
 
 --- GitHub 加速镜像。用法是「前缀 + 原始完整 URL」。
 --- 镜像只影响**下载速度**，不影响安装内容 —— 下载后仍强制校验 SHA-256。
+--- 镜像站普遍按 IP 限流（403 多来自这里，不是 DNS 污染——DNS 污染的表现是
+--- 连接重置/超时/错站内容，不会是干净的 HTTP 403），所以除了自动回退，
+--- UI 还提供手选镜像（见 manifest_urls / _apply_mirror）。
 local GITHUB_MIRRORS = {
     "https://ghfast.top/",
     "https://gh-proxy.com/",
     "https://ghproxy.net/",
+    "https://gh.ddlc.top/",
 }
 
 local UPDATE_CHANNEL = "stable"
@@ -204,7 +208,9 @@ local function validate_manifest(m)
     end
 
     local sha = tostring(m.sha256 or ""):lower():gsub("%s+", "")
-    if not sha:match("^%x{64}$") then
+    -- Lua 模式不支持 {64} 量词：^%x{64}$ 实际是「1 个 hex 字符 + 字面量 {64}」，
+    -- 会把合法 SHA-256 全部拒掉、却放行 "a{64}" 这种垃圾 → 必须用长度 + ^%x+$。
+    if #sha ~= 64 or not sha:match("^%x+$") then
         return nil, "清单缺少合法的 SHA-256"
     end
     return true
@@ -231,6 +237,11 @@ function Updater:new(opts)
         plugin_root = opts.plugin_root or detect_plugin_root(),
         updates_dir = updates_dir,
         state_file = updates_dir .. "/state.json",
+        -- 镜像策略，由 updater_ui 从持久化偏好同步进来（可随时改）：
+        --   nil/"auto"   直连优先，失败依次换镜像
+        --   "direct"     只直连 GitHub，完全不碰第三方镜像
+        --   镜像前缀     该镜像优先，其余镜像与直连兜底
+        mirror = opts.mirror or "auto",
     }, self)
 end
 
@@ -311,10 +322,50 @@ end
 -- 检查更新
 -- ============================================================
 
+--- 镜像化的 URL 长这样：`https://gh-proxy.com/https://raw.githubusercontent.com/...`
+--- —— 路径里还有一个完整 URL。直连地址没有这个特征。
+local function is_mirrored_url(url)
+    return url:match("^https://[^/]+/https://") ~= nil
+end
+
+--- 按用户选择的镜像策略重排 URL 列表（清单与下载共用这一份逻辑）。
+-- 参考 appstore.koplugin 的做法：镜像应是**用户可手选**的——镜像站按 IP 限流，
+-- 哪个能用完全取决于用户网络，自动轮询救不了「全部都被限」的场景。
+function Updater:_apply_mirror(urls)
+    local choice = self.mirror
+    if not choice or choice == "auto" or type(choice) ~= "string" then
+        return urls
+    end
+
+    if choice == "direct" then
+        local out = {}
+        for _, url in ipairs(urls) do
+            if not is_mirrored_url(url) then
+                out[#out + 1] = url
+            end
+        end
+        return out
+    end
+
+    local normalized = choice:sub(-1) == "/" and choice or (choice .. "/")
+    local preferred, rest = {}, {}
+    for _, url in ipairs(urls) do
+        if url:sub(1, #normalized) == normalized then
+            preferred[#preferred + 1] = url
+        else
+            rest[#rest + 1] = url
+        end
+    end
+    for _, url in ipairs(rest) do
+        preferred[#preferred + 1] = url
+    end
+    return preferred
+end
+
 function Updater:manifest_urls()
     local out, seen = {}, {}
     for _, url in ipairs(MANIFEST_URLS) do expand_url(url, out, seen) end
-    return out
+    return self:_apply_mirror(out)
 end
 
 --- 拉取并校验清单。
@@ -339,14 +390,17 @@ function Updater:check()
                 manifest.summary = clean_notes(manifest.summary) or manifest.notes
                 return manifest
             end
-            errors[#errors + 1] = tostring(reason)
+            -- 报错带上 host：直连被墙（连接重置）和镜像限流（HTTP 403）是两种
+            -- 完全不同的故障，混在一起只报最后一个会把「哪个环节挂了」藏起来
+            errors[#errors + 1] = (url:match("^https://([^/]+)") or url) .. "：" .. tostring(reason)
             Log.warn("[Updater] 清单校验失败 " .. url .. "：" .. tostring(reason))
         else
-            errors[#errors + 1] = tostring(err)
+            errors[#errors + 1] = (url:match("^https://([^/]+)") or url) .. "：" .. tostring(err)
             Log.warn("[Updater] 清单请求失败 " .. url .. "：" .. tostring(err))
         end
     end
-    return nil, errors[#errors] or "无法读取更新清单"
+    if #errors == 0 then return nil, "无法读取更新清单" end
+    return nil, table.concat(errors, "；")
 end
 
 -- ============================================================
@@ -366,7 +420,8 @@ function Updater:download(manifest)
 
     self:cleanup_artifacts()
 
-    local urls = package_urls(manifest)
+    -- 下载地址同样遵循用户选择的镜像策略（与清单检查共用 _apply_mirror）
+    local urls = self:_apply_mirror(package_urls(manifest))
     if #urls == 0 then error("更新包地址无效") end
 
     local expected_sha = tostring(manifest.sha256 or ""):lower():gsub("%s+", "")

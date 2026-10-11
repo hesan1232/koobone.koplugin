@@ -4,7 +4,7 @@ local Log = require("koobone.logger")
 local Koobone = require("koobone.koobone")
 
 local ok_info, Info = pcall(require, "koobone.info")
-local CLIENT_VERSION = ok_info and Info and Info.version or "1.5.0"
+local CLIENT_VERSION = ok_info and Info and Info.version or "1.5.1"
 
 local ok_https, https = pcall(require, "ssl.https")
 local ok_http, http = pcall(require, "socket.http")
