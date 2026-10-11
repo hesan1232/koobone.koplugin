@@ -18,6 +18,12 @@ local defaults = {
     },
     shelf = {
         sort_order = "last_read",
+        -- 排序方向：true=正序 / false=倒序 / nil=未显式设置（用该键的默认方向）。
+        -- 系列列表与卷目录**各用一套**（sort_asc vs vol_sort_asc）：
+        -- 书架的排序不该影响「第1卷→第2卷」的漫画阅读顺序（见 bookshelf.lua 注释）。
+        sort_asc = nil,
+        vol_sort = "vol_snumber",   -- 卷目录排序键，默认按卷序号
+        vol_sort_asc = nil,
         -- 曾有 `per_page = 25`，已删：全仓无任何消费方（书架每页条数在
         -- shelf_view.lua 里由 ShelfMenu 的 items_per_page = 8 决定，与它无关）。
     },
@@ -259,6 +265,50 @@ end
 function Settings:set_shelf_sort(v)
     local shelf = self:get("shelf") or {}
     shelf.sort_order = v or "last_read"
+    -- 切换排序键时清掉方向，恢复该键的默认方向（与 reading 的 set_shelf_sort 一致）。
+    -- 不这样做的话，用户「倒序看时间」后切到「按名称」会继承倒序，出现空列表式的意外。
+    shelf.sort_asc = nil
+    self:set("shelf", shelf)
+end
+
+-- 系列列表排序方向：true=正序 / false=倒序 / nil=未设置（调用方按默认方向兜底）
+function Settings:get_shelf_sort_asc()
+    local shelf = self:get("shelf")
+    local v = shelf and shelf.sort_asc
+    if v == nil then return nil end
+    return v == true
+end
+
+function Settings:set_shelf_sort_asc(v)
+    local shelf = self:get("shelf") or {}
+    shelf.sort_asc = (v == true)
+    self:set("shelf", shelf)
+end
+
+-- 卷目录排序键：vol_snumber（按卷序，默认）/ vol_name（按名称）/ update_time（按更新时间）
+function Settings:get_vol_sort()
+    local shelf = self:get("shelf")
+    return (shelf and shelf.vol_sort) or "vol_snumber"
+end
+
+function Settings:set_vol_sort(v)
+    local shelf = self:get("shelf") or {}
+    shelf.vol_sort = v or "vol_snumber"
+    shelf.vol_sort_asc = nil   -- 切键时恢复该键默认方向
+    self:set("shelf", shelf)
+end
+
+-- 卷目录排序方向：true=正序 / false=倒序 / nil=未设置
+function Settings:get_vol_sort_asc()
+    local shelf = self:get("shelf")
+    local v = shelf and shelf.vol_sort_asc
+    if v == nil then return nil end
+    return v == true
+end
+
+function Settings:set_vol_sort_asc(v)
+    local shelf = self:get("shelf") or {}
+    shelf.vol_sort_asc = (v == true)
     self:set("shelf", shelf)
 end
 

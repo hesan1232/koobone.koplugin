@@ -391,6 +391,31 @@ local function format_update_time(ts)
     return os.date("%Y-%m-%d", ts)
 end
 
+-- 列表标题：系列列表用插件标题（opts.title），卷列表用系列名。
+-- 搜索/筛选生效时追加 " [关键字]"，与 reading 插件的云端书库同款。
+-- 注意：必须在 Menu 创建时或 switchItemTable 时传入才可见 —— 上游 title_bar 只在
+-- init()/setTitle() 时重建，直接改 menu.title 不会有任何视觉效果（历史遗留的隐性 no-op）。
+local function compute_list_title(opts, bookshelf)
+    opts = opts or {}
+    local base
+    local sid = opts.series_id
+    if sid and sid ~= "" then
+        local vols = bookshelf and bookshelf:get_series_vols(sid)
+        if vols and vols[1] and vols[1].series and vols[1].series ~= "" then
+            base = vols[1].series
+        else
+            base = _t("系列详情")
+        end
+    else
+        base = opts.title or _t("Koobone 书架")
+    end
+    local f = opts.filter_text
+    if f and f ~= "" then
+        base = base .. " [" .. f .. "]"
+    end
+    return base
+end
+
 -- ============================================================
 -- build_items：两层视图（与 fanqie 的"书架/目录"页面风格一致）
 --   1. opts.series_id 为空 → 系列列表（书架主页）
@@ -413,6 +438,23 @@ local function build_items(opts)
 
     local menu_ref = opts._menu  -- 闭包用（menu 创建后才赋值，闭包执行时读取）
 
+    -- 搜索/筛选关键字（可选）：大小写不敏感的字面子串匹配。
+    -- string.find 第 4 参传 true → plain 模式，关键字里的 . ( ) 等按字面处理而非 pattern。
+    -- 空串/nil = 不过滤。系列列表匹配「标题 + 作者」，卷列表匹配「卷名」。
+    local filter = opts.filter_text
+    if filter == "" then filter = nil end
+    if filter then filter = string.lower(filter) end
+    local function match_filter(...)
+        if not filter then return true end
+        for i = 1, select("#", ...) do
+            local s = select(i, ...)
+            if s and s ~= "" and string.find(string.lower(tostring(s)), filter, 1, true) then
+                return true
+            end
+        end
+        return false
+    end
+
     -- 视图 2：目录页（卷列表）
     local series_id = opts.series_id
     if series_id and series_id ~= "" then
@@ -421,6 +463,18 @@ local function build_items(opts)
         end)
         if not ok_v then vols = nil end
         if not vols then return items end
+
+        -- 搜索过滤：在**排序后的完整列表**上过滤，保证结果顺序仍按当前排序键
+        if filter then
+            local kept = {}
+            for _, vol in ipairs(vols) do
+                if match_filter(vol.title, vol.vol_name) then
+                    kept[#kept + 1] = vol
+                end
+            end
+            vols = kept
+        end
+        if #vols == 0 then return items end
 
         -- 当前系列的"上次阅读卷"的 fmd：用来打 ⭐ 标记
         local last_read_fmd = nil
@@ -510,6 +564,14 @@ local function build_items(opts)
     -- 视图 1：书架主页（系列列表）
     local series_list = bookshelf:get_series_list()
     if not series_list then return {} end
+    -- 搜索过滤（匹配标题 + 作者）
+    if filter then
+        local kept = {}
+        for _, s in ipairs(series_list) do
+            if match_filter(s.title, s.author) then kept[#kept + 1] = s end
+        end
+        series_list = kept
+    end
     for _idx, series in ipairs(series_list) do
         -- 系列封面：用伪 vol 结构（file_md5 = series_<id>）
         -- ⚠️ 注意这个 `series_` 前缀是「封面文件名的伪 fmd」，与 bookshelf.lua 里
@@ -708,16 +770,8 @@ local function trigger_cover_download(opts, menu)
 end
 
 -- ============================================================
--- 排序 / 刷新 按钮 回调
+-- 刷新回调
 -- ============================================================
-local function update_sort(opts, menu, new_sort)
-    local plugin = opts and opts.plugin
-    local bookshelf = plugin and plugin.bookshelf
-    if bookshelf then bookshelf:sort_vols(new_sort) end
-    -- 排序变化后：动态刷新（不关闭菜单）
-    refresh_current(menu)
-end
-
 local function refresh_shelf(opts, menu)
     local plugin = opts and opts.plugin
     if not plugin then return end
@@ -813,6 +867,13 @@ local function refresh_shelf(opts, menu)
     end)
 end
 
+-- ============================================================
+-- 排序 / 搜索 对话框（书架主页与卷列表共用一套交互）
+--   交互参考 reading 插件书架菜单：同一个键再点一次翻转正/倒序，
+--   当前生效的键标 ✓，未生效的键显示它的默认方向。
+--   系列列表的排序持久化在 settings:shelf.sort_order + shelf.sort_asc；
+--   卷列表用独立的 settings:shelf.vol_sort + vol_sort_asc（互不影响）。
+-- ============================================================
 local _sort_dialog = nil
 local function close_sort_dialog()
     if _sort_dialog and ok_UIManager then
@@ -821,59 +882,178 @@ local function close_sort_dialog()
     _sort_dialog = nil
 end
 
+-- 各排序键的默认方向：名称正序，其余倒序（最新/最近阅读在前）
+local function shelf_sort_default_asc(key) return key == "vol_name" end
+local function vol_sort_default_asc(key) return key ~= "update_time" end
+
+-- 系列列表排序对话框
 local function show_sort_dialog(opts, menu)
     if not (ok_UIManager and ok_ButtonDialog) then return end
     local plugin = opts and opts.plugin
     if not plugin then return end
-    close_sort_dialog()
     local settings = plugin.settings
-    local current_sort = settings and settings:get_shelf_sort() or "last_read"
+    if not settings then return end
+    close_sort_dialog()
+    local current_sort = settings:get_shelf_sort()
 
-    local function do_sort(sort_key)
+    local function toggle_sort(key)
         close_sort_dialog()
-        update_sort(opts, menu, sort_key)
+        local bookshelf = plugin.bookshelf
+        if current_sort == key then
+            -- 已是当前键：翻转方向（持久化后原地重刷，不重排缓存）
+            local asc = settings:get_shelf_sort_asc()
+            if asc == nil then asc = shelf_sort_default_asc(key) end
+            settings:set_shelf_sort_asc(not asc)
+            pcall(function() settings:flush() end)
+            if bookshelf then bookshelf.dirty = true end
+        else
+            -- 换键：sort_vols 内部会 set_shelf_sort（顺带清掉方向）+ flush + 标 dirty
+            if bookshelf and bookshelf.sort_vols then
+                pcall(function() bookshelf:sort_vols(key) end)
+            else
+                settings:set_shelf_sort(key)
+                pcall(function() settings:flush() end)
+            end
+        end
+        refresh_current(menu)
     end
 
-    local function choose(choice)
-        if choice == "last_read" then
-            do_sort("last_read")
-        elseif choice == "uptime" then
-            do_sort("uptime")
-        elseif choice == "vol_name" then
-            do_sort("vol_name")
-        end
+    local function sort_btn_text(key, label)
+        local asc = settings:get_shelf_sort_asc()
+        if asc == nil then asc = shelf_sort_default_asc(key) end
+        return label .. "（" .. (asc and _t("正序") or _t("倒序")) .. "）"
+            .. (current_sort == key and "  ✓" or "")
     end
 
     _sort_dialog = ButtonDialog:new{
         title = _t("排序方式"),
         buttons = {
             {
-                {
-                    text = _t("按最后阅读") .. (current_sort == "last_read" and "  ✓" or ""),
-                    callback = function() choose("last_read") end,
-                },
+                { text = sort_btn_text("last_read", _t("按最后阅读")), callback = function() toggle_sort("last_read") end },
             },
             {
-                {
-                    text = _t("按更新时间") .. (current_sort == "uptime" and "  ✓" or ""),
-                    callback = function() choose("uptime") end,
-                },
+                { text = sort_btn_text("uptime", _t("按更新时间")), callback = function() toggle_sort("uptime") end },
             },
             {
-                {
-                    text = _t("按名称") .. (current_sort == "vol_name" and "  ✓" or ""),
-                    callback = function() choose("vol_name") end,
-                },
+                { text = sort_btn_text("vol_name", _t("按名称")), callback = function() toggle_sort("vol_name") end },
             },
             {
-                {
-                    text = _t("取消"),
-                    callback = close_sort_dialog,
-                },
+                { text = _t("取消"), callback = close_sort_dialog },
             },
         },
     }
     UIManager:show(_sort_dialog)
+end
+
+-- 卷列表排序对话框（独立于书架排序）
+local function show_vol_sort_dialog(opts, menu)
+    if not (ok_UIManager and ok_ButtonDialog) then return end
+    local plugin = opts and opts.plugin
+    if not plugin then return end
+    local settings = plugin.settings
+    if not settings then return end
+    close_sort_dialog()
+    local current_sort = settings:get_vol_sort()
+
+    local function toggle_sort(key)
+        close_sort_dialog()
+        local bookshelf = plugin.bookshelf
+        if current_sort == key then
+            local asc = settings:get_vol_sort_asc()
+            if asc == nil then asc = vol_sort_default_asc(key) end
+            settings:set_vol_sort_asc(not asc)
+        else
+            settings:set_vol_sort(key)   -- 同时清掉方向
+        end
+        pcall(function() settings:flush() end)
+        if bookshelf then bookshelf.dirty = true end
+        refresh_current(menu)
+    end
+
+    local function sort_btn_text(key, label)
+        local asc = settings:get_vol_sort_asc()
+        if asc == nil then asc = vol_sort_default_asc(key) end
+        return label .. "（" .. (asc and _t("正序") or _t("倒序")) .. "）"
+            .. (current_sort == key and "  ✓" or "")
+    end
+
+    _sort_dialog = ButtonDialog:new{
+        title = _t("卷排序方式"),
+        buttons = {
+            {
+                { text = sort_btn_text("vol_snumber", _t("按卷序")), callback = function() toggle_sort("vol_snumber") end },
+            },
+            {
+                { text = sort_btn_text("vol_name", _t("按名称")), callback = function() toggle_sort("vol_name") end },
+            },
+            {
+                { text = sort_btn_text("update_time", _t("按更新时间")), callback = function() toggle_sort("update_time") end },
+            },
+            {
+                { text = _t("取消"), callback = close_sort_dialog },
+            },
+        },
+    }
+    UIManager:show(_sort_dialog)
+end
+
+-- 把搜索关键字写进 opts.filter_text 并**就地重刷列表**（不关菜单、保持同一实例）。
+-- 过滤后为空时只提示、保留原列表 —— 否则菜单会因无条目而消失，用户再也没法清筛选。
+local function apply_filter(opts, menu, text)
+    if not menu then return end
+    if text == "" then text = nil end
+    opts = opts or menu._shelf_view_opts
+    if not opts then return end
+    opts.filter_text = text
+    -- menu 绑定的就是这张 opts（ShelfView_show 里 menu._shelf_view_opts = opts），
+    -- 但保险起见：若两者不是同一张表，也把关键字同步过去，避免刷新时丢筛选。
+    if menu._shelf_view_opts and menu._shelf_view_opts ~= opts then
+        menu._shelf_view_opts.filter_text = text
+    end
+    local ropts = menu._shelf_view_opts or opts
+    local items = build_items(merge_opts(ropts, { _menu = menu }))
+    if not items or #items == 0 then
+        if ok_UIManager and ok_InfoMessage then
+            UIManager:show(InfoMessage:new{
+                text = text and _t("没有匹配的结果，已保留原列表") or _t("列表为空"),
+                timeout = 3,
+            })
+        end
+        return
+    end
+    local bookshelf = ropts.plugin and ropts.plugin.bookshelf
+    -- 传新标题（带 [关键字]）→ 上游 switchItemTable 会 setTitle，标题栏才会真正更新
+    menu:switchItemTable(compute_list_title(ropts, bookshelf), items, 1)
+    pcall(function() trigger_cover_download(ropts, menu) end)
+end
+
+-- 搜索对话框（系列列表 / 卷列表共用）
+local function show_search_dialog(opts, menu)
+    if not ok_UIManager then return end
+    local ok_InputDialog, InputDialog = pcall(require, "ui/widget/inputdialog")
+    if not ok_InputDialog then return end
+    local current = (opts and opts.filter_text) or ""
+    local dlg
+    dlg = InputDialog:new{
+        title = _t("搜索"),
+        input = current,
+        input_hint = _t("输入关键字，留空清除"),
+        buttons = {
+            {
+                { text = _t("取消"), callback = function()
+                    pcall(function() UIManager:close(dlg) end)
+                end },
+            },
+            {
+                { text = _t("确定"), is_enter_default = true, callback = function()
+                    local text = (dlg:getInputText() or ""):match("^%s*(.-)%s*$") or ""
+                    pcall(function() UIManager:close(dlg) end)
+                    apply_filter(opts, menu, text)
+                end },
+            },
+        },
+    }
+    UIManager:show(dlg)
 end
 
 -- ============================================================
@@ -1815,6 +1995,21 @@ if ShelfMenu then
                     end
                 end },
             })
+            table.insert(btns, {
+                { text = _t("排序方式"), callback = function()
+                    close_dlg()
+                    show_vol_sort_dialog(opts, self)
+                end },
+            })
+            table.insert(btns, {
+                { text = (opts.filter_text and opts.filter_text ~= "")
+                        and (_t("搜索") .. ": " .. opts.filter_text)
+                        or _t("搜索"),
+                    callback = function()
+                        close_dlg()
+                        show_search_dialog(opts, self)
+                    end },
+            })
             table.insert(btns, { { text = _t("取消"), callback = close_dlg } })
             dlg = ButtonDialog:new{
                 title = _t("目录操作"),
@@ -1834,6 +2029,15 @@ if ShelfMenu then
                     close_dlg()
                     show_sort_dialog(opts, self)
                 end },
+            })
+            table.insert(btns, {
+                { text = (opts.filter_text and opts.filter_text ~= "")
+                        and (_t("搜索") .. ": " .. opts.filter_text)
+                        or _t("搜索"),
+                    callback = function()
+                        close_dlg()
+                        show_search_dialog(opts, self)
+                    end },
             })
             table.insert(btns, { { text = _t("取消"), callback = close_dlg } })
             dlg = ButtonDialog:new{
@@ -1901,18 +2105,8 @@ function ShelfView_show(opts_in)
         return nil
     end
 
-    -- 取系列名做标题
-    local menu_title
-    if not is_vol_view then
-        menu_title = opts.title or _t("Koobone 书架")
-    else
-        local series_title = ""
-        local display_vols = bookshelf:get_series_vols(series_id)
-        if display_vols and display_vols[1] then
-            series_title = display_vols[1].series or ""
-        end
-        menu_title = series_title ~= "" and series_title or _t("系列详情")
-    end
+    -- 标题：系列列表 = opts.title；卷列表 = 系列名。搜索生效时追加 " [关键字]"。
+    local menu_title = compute_list_title(opts, bookshelf)
 
     -- 刷新目录/书架的回调（支持 force=true 强制刷新 API）
     local function refresh_menu_data(menu_to_refresh, force_api)
@@ -2061,27 +2255,21 @@ function ShelfView_update(menu, new_opts_in)
         if current_first_index < 1 then current_first_index = 1 end
     end
 
-    -- 视图层级变化时同步更新标题
+    -- 视图层级变化时同步更新标题（并丢弃上一层的搜索关键字 —— 否则带着
+    -- 系列列表的筛选进到卷列表，会把卷全滤掉，看起来像「系列是空的」）。
     if new_is_vol ~= menu._is_vol_view then
         menu._is_vol_view = new_is_vol
-        if not new_is_vol then
-            menu.title = merged.title or _t("Koobone 书架")
-        else
-            local display_vols = bookshelf:get_series_vols(series_id)
-            if display_vols and display_vols[1] then
-                local st = display_vols[1].series or ""
-                menu.title = st ~= "" and st or _t("系列详情")
-            else
-                menu.title = _t("系列详情")
-            end
-        end
+        merged.filter_text = nil
     end
+    local new_title = compute_list_title(merged, bookshelf)
 
     -- 更新 menu 绑定的 opts（供后续回调使用）
     merged._menu = menu
     menu._shelf_view_opts = merged
 
-    menu:switchItemTable(nil, new_items, current_first_index)
+    -- 传 title：上游 switchItemTable 会 title_bar:setTitle，标题栏才会真正刷新
+    -- （只改 menu.title 是 no-op，title_bar 只在 init/setTitle 时重建）。
+    menu:switchItemTable(new_title, new_items, current_first_index)
     -- 菜单更新后异步下载缺失封面（不阻塞 UI）
     pcall(function() trigger_cover_download(merged, menu) end)
     return menu

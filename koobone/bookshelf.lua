@@ -487,26 +487,40 @@ end
 
 function Bookshelf:get_series_list()
     local series = self:ensure_loaded()
-    -- 排序
+    if not series then return {} end
+    -- 排序键 + 方向。方向未显式设置时按各键默认：名称正序，时间/最近阅读倒序。
     local sort_key = self.settings:get_shelf_sort()
-    if sort_key == "vol_name" then
-        table.sort(series, function(a, b)
-            return (a.title or "") < (b.title or "")
-        end)
-    elseif sort_key == "last_read" then
-        table.sort(series, function(a, b)
-            local ta = a._local_last_read or a._max_last_read or 0
-            local tb = b._local_last_read or b._max_last_read or 0
-            if ta ~= tb then return ta > tb end
-            return (a.last_update_time or tonumber(a.update_time) or 0)
-                 > (b.last_update_time or tonumber(b.update_time) or 0)
-        end)
-    else
-        table.sort(series, function(a, b)
-            return (a.last_update_time or tonumber(a.update_time) or 0)
-                 > (b.last_update_time or tonumber(b.update_time) or 0)
-        end)
+    local asc = self.settings:get_shelf_sort_asc()
+    if asc == nil then asc = (sort_key == "vol_name") end
+
+    local function title_of(s) return tostring(s.title or "") end
+    local function update_of(s) return tonumber(s.last_update_time or s.update_time or 0) or 0 end
+    -- 主键：名称 → 字符串（小写，避免大小写影响）；最近阅读 → 时间戳；其余 → 更新时间
+    local function key_of(s)
+        if sort_key == "vol_name" then
+            return string.lower(title_of(s))
+        elseif sort_key == "last_read" then
+            return tonumber(s._local_last_read or s._max_last_read or 0) or 0
+        end
+        return update_of(s)
     end
+
+    table.sort(series, function(a, b)
+        local a_v, b_v = key_of(a), key_of(b)
+        if a_v ~= b_v then
+            if asc then return a_v < b_v end
+            return a_v > b_v
+        end
+        -- 主键相同：按更新时间，再按标题，保证稳定（方向跟随主排序）
+        local a_u, b_u = update_of(a), update_of(b)
+        if a_u ~= b_u then
+            if asc then return a_u < b_u end
+            return a_u > b_u
+        end
+        local a_t, b_t = title_of(a), title_of(b)
+        if asc then return a_t < b_t end
+        return a_t > b_t
+    end)
     return series
 end
 
@@ -814,18 +828,50 @@ function Bookshelf:_prefill_series_vols(all_vols, series_list_ref)
 end
 
 -- 内部：卷目录排序（独立于书架排序，只用于 get_series_vols 返回前）
--- 规则：永远按卷序号（vol_snumber）升序，代表漫画卷顺序 第1卷→第2卷...
---       time_update 不参与排序——用户明确："time_update时间最新代表当前阅读到这本书"，只用于⭐标记，不参与卷目录排序
---       无 vol_snumber 时 fallback 到卷名称（title/vol_name）字典序，保证稳定
+-- 默认（vol_snumber 升序）代表漫画卷顺序 第1卷→第2卷...
+--   无 vol_snumber 时 fallback 到卷名称（title/vol_name）字典序，保证稳定。
+-- 用户可在「卷列表」的左上角菜单里改排序键（settings 的 vol_sort / vol_sort_asc）：
+--   · vol_snumber（按卷序，默认，正序）· vol_name（按名称，默认正序）· update_time（按更新时间，默认倒序）
+-- 注意：这套设置与书架（系列列表）的 sort_order 完全独立 —— 书架按「最近阅读/更新时间」
+-- 排不影响进入系列后「第1卷→第2卷」的正确阅读顺序。
 function Bookshelf:_sort_vols_catalog(vols)
     if not vols or #vols <= 1 then return vols end
+    local sort_key, asc = "vol_snumber", true
+    if self.settings and self.settings.get_vol_sort then
+        sort_key = self.settings:get_vol_sort() or "vol_snumber"
+        local a = self.settings:get_vol_sort_asc()
+        if a == nil then a = (sort_key ~= "update_time") end
+        asc = a
+    end
+
+    local function nm(v) return tostring(v.title or v.vol_name or "") end
+    local function sn(v) return tonumber(v.vol_snumber) or 0 end
+    local function ut(v) return tonumber(v.time_update or v.update_time or v.last_update_time or 0) or 0 end
+
     table.sort(vols, function(a, b)
-        local sa = tonumber(a.vol_snumber) or 0
-        local sb = tonumber(b.vol_snumber) or 0
-        if sa > 0 and sb > 0 and sa ~= sb then
-            return sa < sb
+        local a_v, b_v, by_primary
+        if sort_key == "vol_name" then
+            a_v, b_v, by_primary = nm(a), nm(b), true
+        elseif sort_key == "update_time" then
+            a_v, b_v, by_primary = ut(a), ut(b), true
+        else
+            -- 按卷序：只有两侧都有有效卷号时才按卷号比（与旧实现一致），否则退到名称
+            local sa, sb = sn(a), sn(b)
+            if sa > 0 and sb > 0 and sa ~= sb then
+                a_v, b_v, by_primary = sa, sb, true
+            end
         end
-        return (a.title or a.vol_name or "") < (b.title or b.vol_name or "")
+        if by_primary and a_v ~= b_v then
+            if asc then return a_v < b_v end
+            return a_v > b_v
+        end
+        -- 主键未分出胜负（或卷号缺失）：按名称（方向跟随主排序），最后按卷号兜底
+        local na, nb = nm(a), nm(b)
+        if na ~= nb then
+            if asc then return na < nb end
+            return na > nb
+        end
+        return sn(a) < sn(b)
     end)
     return vols
 end
