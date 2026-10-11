@@ -21,6 +21,26 @@
    ```
 2. 重启 KOReader 或重新扫描插件即可。
 
+### 从旧版升级到 v1.3.2
+
+v1.3.2 同样是纯代码修复版（删除死代码 + 清理未使用的局部变量），**无需任何手工迁移**：直接覆盖插件目录后重启 KOReader 即可。
+
+> 注意：`X-KB-FROM` 请求头中的客户端版本号会随之变为 `koobone.koplugin/1.3.2 (设备型号)`。
+
+### 从旧版升级到 v1.3.1
+
+v1.3.1 同样是纯代码修复版，**无需任何手工迁移**：直接覆盖插件目录后重启 KOReader 即可。
+唯一行为变化是**网络瞬时错误会自动退避重试 3 次**（弱网下打开书架不再一次失败就报「拉取失败」）。
+
+> 注意：`X-KB-FROM` 请求头中的客户端版本号会随之变为 `koobone.koplugin/1.3.1 (设备型号)`。
+
+### 从旧版升级到 v1.3.0
+
+v1.3.0 为纯代码修复版，**无需任何手工迁移**：配置、缓存、下载目录与阅读进度均向后兼容，
+直接覆盖插件目录后重启 KOReader 即可。
+
+> 注意：`X-KB-FROM` 请求头中的客户端版本号会随之变为 `koobone.koplugin/1.3.0 (设备型号)`。
+
 ### 从旧版升级到 v1.2.1
 
 v1.2.1 已原生整合此前社区维护的 `koobonefixes.koplugin` 所有补丁：
@@ -60,6 +80,63 @@ KOReader 菜单 → 插件 → Koobone 漫画 → 打开书架
       └─ 底部：上一章 / 进度条 / 下一章
 ```
 
+## 检查更新
+
+菜单：**Koobone 漫画 → 检查更新**
+
+| 菜单项 | 说明 |
+|--------|------|
+| **立即检查更新** | 手动检查。有新版会弹出更新说明与「下载并安装」确认框 |
+| **自动检查更新** | 开关。开启时每次启动 KOReader 后延迟 5 秒静默检查一次 |
+| **检查频率** | 每天 / 每 3 天 / 每 7 天。限流用，避免每次启动都打网络 |
+| **安装完成后** | 询问是否重启（默认）/ 自动重启 / 稍后手动重启 |
+| **当前版本** | 只读展示 |
+| **回滚上次更新** | 仅在「装了但重启后没生效」时出现 |
+
+**关于安装**：升级会替换 `plugins/koobone.koplugin/` 下的全部文件，但 **`config.lua` 会被保留**
+（API Key 不用重填）。整个过程分四步，每一步失败都能安全收场：
+
+1. 下载后**强制校验 SHA-256**（清单里带摘要，对不上直接拒绝安装）；
+2. 解压到暂存目录，校验包结构（必须只含一个 `koobone.koplugin` 根目录）与**包内版本号**
+   （必须与清单一致）；
+3. 备份当前插件目录 → 替换文件 → 恢复 `config.lua`；中途任何一步失败都会自动回滚；
+4. 重启 KOReader 后，插件启动时比对「期望版本 vs 实际运行版本」——一致才算更新成功并清掉
+   回滚点；不一致则保留备份，菜单里出现回滚入口。
+
+**关于网络**：更新源是 GitHub Release。国内直连 `github.com` / `raw.githubusercontent.com`
+通常不通，插件会自动改用镜像（ghfast.top / gh-proxy.com / ghproxy.net）。镜像只影响下载速度，
+**不会影响安装内容** —— 下载完仍然强制校验 SHA-256。自动检查只在**已经联网**时进行，绝不主动开 WiFi。
+
+**关于兼容性**：解压走 KOReader 自带的 `ffi/archiver`（纯 Lua），SHA-256 也是自带的纯 Lua 实现，
+因此**不依赖设备上有 `unzip` / `sha256sum` 命令**（Kindle 的 busybox 就没有）。
+
+## 与第三方桌面插件共存（首页手势）
+
+**现象**：首页（文件管理器）里用手势打开书架没反应，但从菜单点「书架」一切正常。
+
+**原因**（KOReader 上游机制，已逐行核对）：`UIManager:sendEvent` 只把派发事件交给窗口栈
+最上面那个控件；它不消费时，才继续交给「该控件的 `active_widgets`」与「标了
+`is_always_active` 的控件」。而 `FileManager` 自身既不是 `is_always_active`，插件也没被登记
+进它的 `active_widgets` —— 于是**只要有控件盖在首页之上**（例如第三方桌面类插件），
+`Dispatcher` 派发到本插件的动作就永远送不到。
+
+菜单项不受影响：它是回调**直接调方法**，不走事件派发 —— 这个不对称就是判别式。
+
+**处理**：插件启动时把自身挂进 `ui.active_widgets`（上游留的正是这个口子 ——
+`registerModule(name, module, always_active)` 的第三个参数，注释写着
+"to get events even when hidden"）。挂进去的是一个只放行本插件自有事件的**桥**：
+触摸 / 按键等输入事件一概不转发，因此不改变任何既有行为。
+
+**边界**（这两条绕不过去，属上游 `sendEvent` 本身的设计）：
+
+1. 遮挡控件**主动消费**了事件（返回 `true`）—— 那是它的正当行为，不该绕过；
+2. 遮挡控件在事件链上**抛错** —— `sendEvent` 里 `if top_widget:handleEvent(event) then`
+   没有 `pcall` 保护，异常会让整条派发链中断（表现为 KOReader 崩溃/重启），
+   此时任何插件都收不到。这种情况要修的是那个控件本身（或先禁用它）。
+
+排查提示：先看 `crash.log` 有没有 `Failed to initialize` 或指向别的插件的崩溃栈；
+另外 KOReader 的手势设置分**两套**（`gesture_fm` 首页 / `gesture_reader` 阅读界面），互不通用。
+
 ## 配置说明
 
 进入 KOReader 菜单 → 插件 → Koobone 漫画 → 设置：
@@ -70,7 +147,8 @@ KOReader 菜单 → 插件 → Koobone 漫画 → 打开书架
 | **API Key 设置** | 在 [koobone.com](https://koobone.com/) 官网登录后，进入"个人设置"页面获取 API Key，填入此处即可 |
 | **排序方式** | 书架默认排序：更新时间 / 名称 / 最后阅读 |
 | **预下载卷数** | 打开漫画后自动预下载的后续卷数 |
-| **缓存大小上限** | EPUB 缓存最大占用空间（MB） |
+| **缓存大小上限** | EPUB 缓存最大占用空间（MB）；超出后按最久未访问（LRU）清理到 80% |
+| **自动清理缓存** | 是否自动清理 EPUB 缓存（过期 48 小时、或超上限）。默认开启 |
 | **进度上传间隔** | 阅读时自动上传进度的间隔（秒） |
 | **下载封面** | 是否下载漫画封面到本地 |
 
@@ -134,7 +212,179 @@ API Key 通过 `X-KB-INFO` 请求头直传服务端鉴权，无需配置 Cookie/
 - 不使用 `//` 整数除法、`utf8` 库、`bit32` 库、`_ENV`、`goto`、`__pairs` 等 5.2+/5.3+ 特性
 - `loadstring` / `load` 编译兼容
 
+## 发布流程
+
+插件的「检查更新」读的是仓库 `main` 分支根目录的 `update.json`，包则在 GitHub Release 上。
+两者都由打包脚本一次生成：
+
+```bash
+# 1. 改代码，并把 koobone/info.lua 的 version 改好（版本号只有这一个来源）
+# 2. 打包 + 生成清单（版本号、包大小、SHA-256 全部自动计算）
+python .workbuddy/tools/pack_plugin.py D:/webProgram/project/koobone.koplugin
+# 3. 提交（注意 update.json 要和代码一起进 main 分支，否则客户端读不到）
+git add -A && git commit -m "v1.4.0"
+git tag v1.4.0
+git push origin main --tags
+# 4. 在 GitHub 上按 v1.4.0 建 Release，上传 koobone.koplugin.zip
+```
+
+脚本会自动把用户的 `config.lua` 排除在包外（含 API Key，绝不发布），zip 内保留一层
+`koobone.koplugin/` 根目录，并且**按字节写入、完整保留源文件行尾**。
+
+> ⚠️ 打包前确认没有未提交的源文件 —— `pack_plugin.py` 是从**工作目录**读取的，
+> 而别人 `git clone` 拿到的是**已提交内容**。两者不一致时，更新包会比仓库多/少文件。
+
 ## 更新日志
+
+### v1.4.0（2026-10-11）
+
+**新增：插件内「检查更新」与一键升级**（设计参考觅阅 miuread）
+
+- **检查更新**：菜单「Koobone 漫画 → 检查更新 → 立即检查更新」。从 GitHub Release 的
+  `update.json` 读最新版本号做语义化比对。清单里同时带 4 个下载地址（GitHub 原址 + 3 个国内
+  镜像），直连不通时自动换下一个。
+- **自动检查**：启动 5 秒后静默检查一次，默认 24 小时最多一次（可关、可改频率），同一个新版本
+  只提醒一次。**只在已联网时检查**，绝不主动开 WiFi。
+- **下载与安装**：下载后强制校验 SHA-256 → 解压到暂存目录并校验包结构与包内版本号 →
+  备份当前插件 → 替换 → 恢复用户配置。任何一步失败都自动回滚到旧版本。
+- **安装后重启**：可选「询问（默认）/ 自动重启 / 稍后手动」。重启后插件启动时比对
+  「期望版本 vs 实际运行版本」，一致才算更新成功并清掉回滚点；不一致则保留备份并给出回滚入口。
+- **保留用户配置**：`config.lua`（含 API Key）在升级时被完整保留。更新包本身也禁止含
+  `config.lua` —— 发布包不该带凭证，真带上了直接拒绝安装。
+- **零外部命令依赖**：解压用 KOReader 自带的 `ffi/archiver`（纯 Lua），SHA-256 也是纯 Lua 实现，
+  不依赖设备上的 `unzip` / `sha256sum`。
+
+新增模块：`koobone/digests.lua`（SHA-256）、`koobone/updater_http.lua`（清单拉取与包下载）、
+`koobone/updater.lua`（清单校验 / 下载 / 备份替换 / 回滚 / 启动确认）、
+`koobone/updater_ui.lua`（菜单与流程编排）；`helper.lua` 新增 `H.unzip_file`。
+
+**同时修掉两个会让功能「静默失效」的问题**
+
+- **`redirect` 参数让所有 HTTPS 更新请求在发出前就失败**：更新器给请求传了
+  `redirect = true`，而 LuaSec 的 `ssl/https.lua` **不支持自动重定向** ——
+  `elseif url.redirect then return nil, "redirect not supported"`，请求根本发不出去。
+  设备日志里就是 `[Updater] 清单请求失败 … redirect not supported`（自动检查因此一直失败）。
+  改为手动跟随跳转（上限 5 次）。
+- **`init()` 里任何一处抛错会弄哑整个插件**：上游 `PluginLoader:createPluginInstance`
+  用 `pcall(plugin.new, plugin, attr)` 包住构造，而 `Widget:new` 内部就会调 `init()` ——
+  也就是说 `init()` 抛错时**插件实例根本不会被创建**，现场只留一行
+  `logger.err("Failed to initialize", ...)` 日志。后果是主菜单与手势动作一起消失，而
+  `Dispatcher:execute` 查不到动作名时**静默跳过**，用户看到的就是「首页手势点了没反应」。
+  现拆成 `init + _init_modules`：动作注册最先跑且不依赖任何模块，模块构造整段 `pcall`，
+  失败只降级为「插件不可用但实例仍在」。
+- **首页被第三方桌面插件遮挡时手势也能生效**：把手势动作事件挂进 `ui.active_widgets`
+  （详见「与第三方桌面插件共存」一节）。
+
+### v1.3.3（2026-10-11）
+
+**第四轮复查 · 清理 / 重复 / 性能**（无用户可见功能变更）
+
+- **删除整模块死代码**：`koobone/i18n.lua`（228 行、约 170 条翻译表）。它在 `main.lua` 里
+  `safe_require` 之后**全仓零 `I18n.*` 调用** —— 界面文案一直走 KOReader 的 gettext
+  （`shelf_view.lua` 的 `_t`），这个自建翻译层从未接线。如日后要做英文界面，需重新接入
+  并把硬编码中文换成 `I18n.tr`，属独立议题（旧文件在 git 历史与第三轮清理的备份里）。
+- **清理死变量 / 死分支 / 悬挂钩子**：`http_downloader` 的 `remote_content_length`（在 sink 内被读取，
+  而唯一赋值发生在请求返回**之后** → 分支恒假）+ 未使用的 `response_headers` + 随之变成死代码的
+  `extract_content_length`；`download.lua` 的 `cancel_requested`（无读取方，真正生效的是 IPC
+  `cancel.flag`）与 `_queue_processing` / `_queue_listeners` 两个**快照**（布尔快照永远停在初始值）；
+  `queue.lua` 的队列通知子系统（`_queue_listeners` 无生产者、`_notify` 恒遍历空表、
+  `get_status` 仅被 `_notify` 调用）；`shelf_view.lua` 的 `check_download_state`（零调用）、
+  `ShelfMenu:onPageChanged` / `shelf_close_cb` / `_shelf_menu_closed_callback`，以及
+  `on_page_changed` / `_suppress_page_callback` 这对**无任何赋值**的页面回调钩子
+  （`Menu` 基类并没有 `onPageChanged`，被覆盖的 `Menu.onPageChanged(...)` 其实是 nil 调用）。
+- **重复常量归一**：`DESKTOP_UA` 原本在 `client.lua` / `http_downloader.lua` 各一份，`koobone.lua`
+  里还有第三份且版本不同（Chrome/150，**全仓无人读取**）→ 统一为 `H.DESKTOP_UA`（值保持
+  Chrome/120 不变：UA 属对外行为，不顺手改）；`http_downloader` 中零调用的 `M.clamp` /
+  `M.format_size`（`download_progress.lua` 有自己的同名 local 实现）删除。
+- **未消费配置**：`shelf.per_page` 删除（书架每页条数实际由 `shelf_view.lua` 的
+  `items_per_page = 8` 决定，与它无关）。
+- **版本号回退字面量对齐**：`main.lua` 的 fallback 由 `"1.2.0"` 改为与其余 5 处一致的当前版本。
+- **性能**：`helper.json_decode` / `json_encode` 的 `pcall(require, "json")` 改为模块级惰性缓存 ——
+  它们处在「主进程每 0.3s 读一次进度文件」的 IPC 热路径上。
+
+> 有意保留：`state.lua` 的 15 个「未接线访问器」（与状态字段一一对应，成组才有意义）、
+> `Async.active_count`、`Progress:manual_pull`、`Bookshelf:download_cover_file` / `Client:get_binary`
+> 等**动态派发**调用点（静态工具看不见，非死代码）。
+
+### v1.3.2（2026-10-10）
+
+**死代码清理（删除 43 个零调用函数 / 净减 772 行，纯删除无行为变更）**
+
+- 用静态检查重算不可达集合后**逐个人工 grep 复核**（该工具对动态派发有误报），删除 43 个零调用函数，
+  例如 `auth.is_logged_in`、`client.get_user_info` / `header_value`、`download.clear_queue` / `_cache_key`、
+  `helper.download_file` 系列、`logger.clear_log`、`progress.destroy` / `update_page`、
+  `settings.merge_tables` 等。
+- **保留**工具看不见但确实可达者：`Async.active_count`（与局部变量重名）、
+  `download_cover_file` / `get_binary` / `trigger_cover_download`、
+  `ShelfView_show|update|close|refresh_current`（经 `main.lua` 动态派发）、
+  `Progress:manual_pull`（有意保留的手动入口）。
+- 另清理未使用的局部变量：`http_downloader.lua` 的 `ltn12` / `ok_ssl,ssl` / `ok_tcp,tcp`，
+  `main.lua` 的 `TextViewer`。
+- `koobone/state.lua` 里 15 个「未接线访问器」**成组保留**并在注释中列出，供后续按需接线或成组删除。
+
+### v1.3.1（2026-10-10）
+
+**修复：写盘 / 取消信号的返回值此前无人检查（6 处）**
+
+- **取消信号可能写不出去，而调用方仍以为「已取消」** — `http_downloader.ipc_write_cancel` 用 `pcall` 包住写
+  `_cancel.flag` 的整个流程并丢弃结果，`Download:cancel` 又无条件置 `signalled = true`。于是
+  「磁盘满 / 句柄异常」时用户点了取消、界面回「已取消」，**子进程照跑到底**。现在
+  `ipc_write_cancel` 返回是否确认写入、`ipc_send_cancel` 原样透传，`cancel` 只在**确实写入**时才算命中，
+  失败记 warn 并如实返回 false。
+- **进度 IPC 文件写入失败静默丢失** — `http_downloader.ipc_write_progress` 同理：写失败时 `os.rename`
+  仍可能成功，父进程会读到一个空 / 截断的进度 JSON（表现为进度条不动）而没有任何线索。现检查
+  `write`/`close`、失败时清掉 `.tmp`；告警只打一次（本函数按进度 tick 高频调用，避免刷爆日志）。
+- **书架缓存原子写** — `bookshelf.save_shelf_cache` 此前无条件 `rename`：写入失败时会把一个
+  **截断的 Lua 源码缓存**换上去，而该缓存由 `loadfile` 直接执行 → 下次启动解析失败，书架回到空状态。
+  现写入失败即删 `.tmp` 并返回 false。
+- **封面写入** — `bookshelf.download_cover_file` / `download_covers` 补 `write`/`close` 检查：
+  原有的「写后 size == 0」只能抓住完全为空，抓不住**写了一半**（半张封面会被显示，且文件已存在不会重下）。
+- **日志写入**（`logger.lua`）— 补 `write` 返回值检查：失败时关闭并丢弃句柄（下次调用自动重开），
+  否则之后每条日志都对着一个坏句柄写、全部静默丢失。
+
+**新增：网络错误分级重试（`client.lua`）**
+
+- 移植 `reading.koplugin/reading/webdav.lua` 的 `RETRY_CONFIG` / `is_retryable_code` / `get_retry_delay`。
+  此前 **API 层完全没有重试**：一次瞬时连接失败或瞬时 5xx 就会把异常抛给调用方，而
+  `bookshelf:refresh` 是「一次失败即中止」—— 弱网下打开书架＝「书架为空 / 拉取失败」。
+- 分级判据：`nil`（连接被重置 / 异常）、`5xx`、`408`、`429` → 指数退避重试（1s → 2s，上限 4s，共 3 次）；
+  `4xx`（401/403/404…）与业务错误 → **立即停**，不再白等。
+- 每次重试**重建 sink**（失败尝试的响应体已写入 sink，沿用会把两次响应拼在一起 → JSON 解析必然失败）。
+- 重试耗尽后若最后一次是异常，原样重新抛出 —— 调用方原有「连接失败会 error」的行为不变。
+- ⚠️ 调用点全部在 `Async.run` 子进程内（`bookshelf:refresh` / `progress:query_vol_info` / 封面下载），
+  因此 `socket.sleep` 不会阻塞 UI 线程；EPUB 下载路径走 `http_downloader` 直连，不经过本层，两者不叠加。
+
+### v1.3.0（2026-10-10）
+
+本版集中修复了「进度同步」「下载取消」两条主链路上此前**实际失效**的问题，并补齐取消/会话的并发安全。
+
+**修复（此前功能实质不可用）：**
+
+- **阅读进度同步整体空转** — `reader.lua` 调用了 `progress.lua` 中并不存在的 `update_local_progress` / `push_to_cloud` / `last_page` / `total_pages`。现已对齐 API：`progress.lua` 新增 `_sync_public()` 并重写 `end_session(cb, {skip_upload})`（原实现先置 `_destroyed`，导致关闭时推送变成空操作）；`reader.lua` 新增 `Reader:get_progress()` 与 `current_vol` 只读视图，`shelf_view` 改读该视图
+- **手动上传云端进度永远失败** — `client:upload_progress` 不存在（被 `shelf_view` 调用）。已新增薄封装桥接到 `report_read_page`
+- **下载去重/排队失效** — `queue.is_enqueued` 读取了未定义的 `state.pending`，恒返回 false。改读实名数组 `state._download_queue`
+- **断点续传检测可能报错** — `http_downloader.lua` 裸用 `lfs` 却未 require。已补 `pcall(require, "libs/libkoreader-lfs")`，并修正 `lfs.attributes(path, "size")` 的返回值用法
+- **取消下载不通知子进程** — `Download:cancel` 不存在。现新增统一入口（出队 + 写 `_cancel.flag` + 标 `cancel_requested`），子进程读循环内检测后真正终止；同时删除两条并行的旧下载路径与一批死代码
+- **子进程「无输出」被误判为失败** — `Async` 原先把「退出码 0 但无输出」当失败，会让已经成功的操作弹出「加载失败」。现按「无输出 = 无返回值的成功」处理
+- **`handle.cancel` 是死代码** — 现已真正接线：新增模块级活动登记表与 `Async.cancel_all()` / `Async.cancel_tag(tag)`，并在「正常完成 / 取消 / 超时」三条终结路径上退登记；新增 `opts.on_cancel`，供带 loading 的流程在取消时关闭弹窗（取消后 `on_done` 不再执行，否则界面会永久卡 loading）
+- **EPUB 缓存 LRU 清理整条链路是死的** — `Download:_lru_cleanup` 与它唯一的实现 `H.lru_cleanup`（68 行）全仓库零调用，`cache.lru_cleanup_enabled` 只写不读 —— README 承诺的「LRU 策略清理过期和超缓存」从未发生，`EPUB_CACHE_DIR` 只会无限增长。现已接线：**下载成功后**触发一次 + **启动后延迟 10 秒**触发一次（内部 1 小时频率门限，批量下载不会反复扫盘），并在「下载设置」里补上**缓存大小上限**与**自动清理缓存**两个开关（此前 `cache_max_size_mb` 只能手改 `config.lua`）
+- **打开漫画 / 换卷时进度同步被误终止** — `onCloseWidget` 此前用 `self.ui.document` 判断「是不是阅读器关闭」，而该字段在此时恒为 nil。改为**会话归属**判定（`Reader:claim_session(ui)` 在 `onReaderReady` 认领 + `is_session_owner(ui)` 比对）
+- **换卷时上一卷的最后进度静默丢失** — `open_comic` 现在先对上一卷 `close_reader(true)` 再开启新会话
+
+**新增：**
+
+- **页码实时更新** — 新增 `onPageUpdate` / `onPosUpdate` 钩子，页码不再只由 30s 周期同步（短时阅读退出时此前推的是起始页）。注意 `onPosUpdate` 的第二参数才是页码，滚动模式只发该事件
+- **下载健壮性** — 下载 sink 增加 `write` 返回值检查（磁盘写满时不再落盘截断却报成功）与速率停滞检测（`STALL_MS` / `MIN_RATE`，识别「还在滴数据但慢到不可用」）；`sink_err_msg` 优先于 HTTP 状态码上报，避免真因被含糊的 `HTTP nil` 掩盖
+- **防串号令牌** — 会话代次（`Reader._session_gen` / `Progress._session_gen`）与视图令牌（`shelf_view._view_token` / `_progress_dialog_token`），避免「打开界面 + 异步回填」被上一轮结果覆盖
+
+**顺带修正：**
+
+- `Log.err` → `Log.error`、`Log.flush` → `Log._flush`（方法名写错，调用即报错）
+- `main.lua` 中 `ok_Async` 未定义 → `onShowToc` 异步分支永不可达
+- `state.lua` 裸用 `UIManager` 未 require → 3 秒聚合写盘从未生效
+- `onGesture` 里调用不存在的 `showSettings()` 会崩掉整个 KOReader（改可选钩子 + pcall 保护）
+- 版本号统一为 `koobone/info.lua` 单一来源，其余 4 处回退字面量同步更新（此前停留在 `0.2.0`）
+- 「关于」菜单里的版本号此前硬编码为 `v0.3.0`（第 5 处版本字面量）→ 改为从 `koobone/info.lua` 读取
 
 ### v1.2.1（2026-09-13）
 

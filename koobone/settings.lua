@@ -3,6 +3,9 @@ local LuaSettings = require("luasettings")
 local H = require("koobone.helper")
 local Log = require("koobone.logger")
 local Koobone = require("koobone.koobone")
+-- 「关于」里的版本号唯一来源是 koobone/info.lua（此前这里硬编码 v0.3.0，
+-- 与 info.lua 的版本号长期不一致 —— 属第 6 处版本字面量）。
+local ok_info, Info = pcall(require, "koobone.info")
 
 local Settings = {}
 Settings.__index = Settings
@@ -15,7 +18,8 @@ local defaults = {
     },
     shelf = {
         sort_order = "last_read",
-        per_page = 25,
+        -- 曾有 `per_page = 25`，已删：全仓无任何消费方（书架每页条数在
+        -- shelf_view.lua 里由 ShelfMenu 的 items_per_page = 8 决定，与它无关）。
     },
     cache = {
         download_covers = true,
@@ -44,20 +48,6 @@ local function deepcopy(value)
     return out
 end
 
-local function merge_tables(default, override)
-    local result = deepcopy(default)
-    if type(override) ~= "table" then
-        return result
-    end
-    for key, value in pairs(override) do
-        if type(value) == "table" and type(result[key]) == "table" then
-            result[key] = merge_tables(result[key], value)
-        else
-            result[key] = value
-        end
-    end
-    return result
-end
 
 function Settings:new()
     local data_dir = H.get_data_dir()
@@ -306,6 +296,26 @@ function Settings:get_cache_max_mb()
     return self:get("cache") and self:get("cache").cache_max_size_mb or 1024
 end
 
+function Settings:set_cache_max_mb(n)
+    local cache = self:get("cache") or {}
+    cache.cache_max_size_mb = tonumber(n) or 1024
+    self:set("cache", cache)
+end
+
+--- 是否开启 EPUB 缓存自动清理（LRU）。
+-- 默认 **true**：老用户的 store 里根本没有这个字段，必须按「开启」处理，
+-- 否则「修好了接线却因为旧配置而为 nil 被当成关闭」= 等于没修。
+function Settings:is_cache_lru_enabled()
+    local cache = self:get("cache") or {}
+    return cache.lru_cleanup_enabled ~= false
+end
+
+function Settings:set_cache_lru_enabled(enabled)
+    local cache = self:get("cache") or {}
+    cache.lru_cleanup_enabled = enabled == true
+    self:set("cache", cache)
+end
+
 function Settings:get_pre_download_chapters()
     return self:get("reader") and self:get("reader").pre_download_pages or 0
 end
@@ -536,6 +546,40 @@ function Settings:build_menu_items(plugin)
                     end,
                 },
                 {
+                    text = _("缓存大小上限"),
+                    callback = function()
+                        input_dialog(
+                            _("缓存大小上限"),
+                            _("EPUB 缓存超过该值后，按最久未访问清理到 80%（单位 MB）"),
+                            tostring(self:get_cache_max_mb()),
+                            false,
+                            function(value)
+                                local n = tonumber(value)
+                                if n and n >= 64 then
+                                    self:set_cache_max_mb(n)
+                                    self:flush()
+                                    show_info(_("缓存大小上限已保存"))
+                                else
+                                    show_info(_("请输入不小于 64 的整数"))
+                                end
+                            end
+                        )
+                    end,
+                },
+                {
+                    text = _("自动清理缓存"),
+                    checked_func = function()
+                        return self:is_cache_lru_enabled()
+                    end,
+                    callback = function()
+                        self:set_cache_lru_enabled(not self:is_cache_lru_enabled())
+                        self:flush()
+                        show_info(self:is_cache_lru_enabled()
+                            and _("已开启：下载完成后自动清理过期/超量缓存")
+                            or _("已关闭自动清理"))
+                    end,
+                },
+                {
                     text = _("清除所有缓存"),
                     callback = function()
                         confirm_dialog(
@@ -616,7 +660,10 @@ function Settings:build_menu_items(plugin)
                     end,
                 },
                 {
-                    text = _("Koobone 插件 v0.3.0"),
+                    -- 版本号从 koobone/info.lua 读（唯一来源）；此前是硬编码的 v0.3.0
+                    text = (ok_info and Info and Info.version)
+                        and ("Koobone 插件 v" .. tostring(Info.version))
+                        or "Koobone 插件",
                     enabled = false,
                     callback = function() end,
                 },

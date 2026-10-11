@@ -178,9 +178,6 @@ local function serialize_table_list_to_lua(list, saved_at, label, vol_index, vol
     return table.concat(lines, "\n")
 end
 
-local function get_shelf_cache_path(settings)
-    return H.get_data_dir() .. "/shelf_cache.lua"
-end
 
 -- save_shelf_cache(series_list): 书架主数据（系列）持久化 + 本地进度索引持久化
 local function save_shelf_cache(self, series_list)
@@ -206,8 +203,17 @@ local function save_shelf_cache(self, series_list)
         Log.error("save_shelf_cache: 无法写入临时文件")
         return false
     end
-    f:write(content)
-    f:close()
+    -- ⚠️ write/close 返回值必须检查：Lua stdio 是带缓冲的，磁盘写满/配额耗尽时
+    -- write 往往不报错、close 才暴露。否则下面的 os.rename 会成功地把一个**截断的
+    -- Lua 源码缓存**换上去，而该缓存是用 loadfile 直接执行的 → 下次启动解析失败，
+    -- 书架回到空状态（用户看到「书架全没了」）。
+    local write_ok, write_err = f:write(content)
+    local close_ok, close_err = f:close()
+    if not write_ok or close_ok == nil then
+        Log.error("save_shelf_cache: 写入/关闭临时文件出错 " .. tostring(write_err or close_err))
+        os.remove(tmp_path)
+        return false
+    end
     local ok, err = os.rename(tmp_path, self.shelf_cache_file)
     if ok then
         Log.debug("书架缓存已写入(内存+文件), ", #series_list, "系列")
@@ -325,32 +331,6 @@ local function clear_shelf_file_cache(self)
     end
 end
 
--- 三层缓存同步清理
-function Bookshelf:clearShelfCache()
-    -- L1: client 层 API 短缓存
-    if self.client then
-        if self.client.clearVolListCache then
-            self.client:clearVolListCache()
-        end
-        if self.client.clearSeriesListCache then
-            self.client:clearSeriesListCache()
-        end
-    end
-    -- L2: 显示层内存缓存
-    SERIES_MEM_CACHE = nil
-    SERIES_MEM_TS = 0
-    SERIES_VOLS_MEM = {}
-    LOCAL_VOL_INDEX = {}
-    state.clearShelfVols()
-    -- L3: 文件持久化缓存
-    clear_shelf_file_cache(self)
-    -- 衍生缓存同步清理
-    state.invalidateDirectoryCache()
-    state.invalidateDownloadedVols()
-    self.vols = {}
-    self.dirty = true
-    Log.info("Bookshelf.clearShelfCache: 三层缓存已清理")
-end
 
 -- ============================================================
 -- 对外接口
@@ -408,6 +388,8 @@ function Bookshelf:refresh(force)
     local raw_series = series_or_err or {}
 
     -- 回填本地进度信息（last_read、last_readpage、total_pages）
+    -- 注意键前缀用「冒号」（"series:"..id）—— 这是 LOCAL_VOL_INDEX 的命名空间；
+    -- shelf_view 里拼封面文件名的伪 fmd 用的是「下划线」（"series_"..id），二者不同。
     for _, s in ipairs(raw_series) do
         local info = LOCAL_VOL_INDEX["series:" .. tostring(s.id or "")]
         if info then
@@ -944,17 +926,6 @@ function Bookshelf:sort_vols(sort_key)
     -- 对 shallow_copy 副本做的，切 sort 完全不影响缓存有效性 → 避免切 sort 后目录全 miss 重新打 API
 end
 
--- ------- 兼容旧调用方的辅助方法 -------
-function Bookshelf:get_vols()
-    -- 废弃：不再有"全局 vols"。如需某系列的 vols，用 get_series_vols(series_id)
-    Log.debug("Bookshelf:get_vols 已废弃，返回空")
-    return self.vols or {}
-end
-
-function Bookshelf:get_count()
-    local series = self:ensure_loaded()
-    return #series
-end
 
 function Bookshelf:get_vol_by_fmd(fmd)
     if not fmd then return nil end
@@ -994,9 +965,6 @@ function Bookshelf:get_vol_by_fmd(fmd)
     return nil
 end
 
-function Bookshelf:_rebuild_series_map()
-    -- 已废弃（不需要从全局 vols 派生系列 map）
-end
 
 -- ============================================================
 -- 封面（同步阻塞下载，UI层应使用异步批量调用 download_covers）
@@ -1029,8 +997,14 @@ function Bookshelf:download_cover_file(cover_url, save_path)
     if not file then
         return false, "无法打开文件: " .. tostring(err_open or save_path)
     end
-    file:write(data)
-    file:close()
+    -- ⚠️ write/close 返回值必须检查：下面的 size 检查只抓得住「完全为空」，
+    -- 抓不住「写了一半」——截断的封面会以半张图的形式显示，且文件存在不会被重下。
+    local write_ok, write_err = file:write(data)
+    local close_ok, close_err = file:close()
+    if not write_ok or close_ok == nil then
+        pcall(os.remove, save_path)
+        return false, "写入封面失败: " .. tostring(write_err or close_err)
+    end
     local lfs = require("libs/libkoreader-lfs")
     local attr_ok, attr = pcall(function() return lfs.attributes(save_path) end)
     if not attr_ok or not attr or not attr.size or attr.size == 0 then
@@ -1040,106 +1014,6 @@ function Bookshelf:download_cover_file(cover_url, save_path)
     return true, tostring(code_or_err or "")
 end
 
-function Bookshelf:get_cover_local_path(vol)
-    if not vol then return nil end
-    local fmd = tostring(vol.file_md5 or vol.fmd or "")
-    if fmd == "" then return nil end
-    if self.covers[fmd] then
-        return self.covers[fmd]
-    end
-    local covers_dir = H.get_covers_dir()
-    H.make_dir(covers_dir)
-    local filename = H.cover_filename_for(fmd)
-    local cover_path = H.join_path(covers_dir, filename)
-    if H.file_exists(cover_path) then
-        local lfs = require("libs/libkoreader-lfs")
-        local ok, attr = pcall(function()
-            return lfs.attributes(cover_path)
-        end)
-        if ok and attr and attr.size and attr.size > 0 then
-            self.covers[fmd] = cover_path
-            return cover_path
-        else
-            os.remove(cover_path)
-        end
-    end
-    if not self.settings:should_download_covers() then
-        return nil
-    end
-    local cover_url = vol.cover_url
-    if not cover_url or cover_url == "" then
-        return nil
-    end
-    local ok, err = self:download_cover_file(cover_url, cover_path)
-    if ok then
-        self.covers[fmd] = cover_path
-        return cover_path
-    else
-        Log.warn("下载封面失败:", fmd, err)
-    end
-    return nil
-end
-
--- 批量静默下载封面（异步调用，不阻塞UI）
--- 下载成功后写回 vol.cover_path，内存缓存共享引用，下次刷新自动生效
-function Bookshelf:download_covers(vols)
-    -- fanqie 同款：for 循环 client:get_binary 拿二进制，io.open+write 写文件
-    -- （调用方负责放在异步/逐个 yield 的场景里，避免单次调用太久）
-    if not vols or #vols == 0 then return end
-    if not self.settings or not self.settings.should_download_covers or not self.settings:should_download_covers() then return end
-    local covers_dir = H.get_covers_dir()
-    H.make_dir(covers_dir)
-    local count = 0
-    for _, vol in ipairs(vols) do
-        if not vol.cover_path then
-            local fmd = tostring(vol.file_md5 or vol.fmd or "")
-            if fmd ~= "" and vol.cover_url and vol.cover_url ~= "" then
-                local cover_path = H.join_path(covers_dir, H.cover_filename_for(fmd))
-                if not H.file_exists(cover_path) then
-                    local ok_dl, err_dl = pcall(function()
-                        local data = self.client:get_binary(vol.cover_url, { timeout = 30 })
-                        local f = io.open(cover_path, "wb")
-                        if f then
-                            f:write(data)
-                            f:close()
-                            vol.cover_path = cover_path
-                            self.covers[fmd] = cover_path
-                            return true
-                        end
-                        return false
-                    end)
-                    if ok_dl and err_dl == true then
-                        count = count + 1
-                    else
-                        Log.warn("[Koobone] download_covers 失败 fmd=" .. fmd .. ": " .. tostring(err_dl or ""))
-                    end
-                else
-                    vol.cover_path = cover_path
-                    self.covers[fmd] = cover_path
-                end
-            end
-        end
-    end
-    if count > 0 then
-        Log.info("Bookshelf:download_covers 成功下载", count, "个封面")
-    end
-end
-
-function Bookshelf:get_progress_text(vol)
-    if not vol then return "未开始" end
-    local last_readpage = tonumber(vol.last_readpage) or 0
-    local total_pages = tonumber(vol.total_pages) or 0
-    if total_pages <= 0 then
-        return "未开始"
-    end
-    if last_readpage <= 0 then
-        return "未开始"
-    end
-    if last_readpage >= total_pages then
-        return "已读完"
-    end
-    return string.format("%d/%d页", last_readpage, total_pages)
-end
 
 function Bookshelf:_save_shelf_cache()
     -- 对外的 save 接口：持久化当前 SERIES_MEM_CACHE（书架）+ 本地进度索引

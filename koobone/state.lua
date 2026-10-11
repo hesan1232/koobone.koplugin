@@ -1,3 +1,9 @@
+-- UIManager 必须显式 require：KOReader 不提供全局 UIManager（上游 frontend/ui/uimanager.lua
+-- 是 `local UIManager = {...} return UIManager`；device 里的 `UIManager = uimgr` 赋的是各文件
+-- 自己顶部的 `local UIManager`）。此前这里裸用 UIManager，`type(UIManager)=="table"` 恒为 false
+-- → schedule_flush_later 每次都走「立即 flush」兜底分支，注释里写的 3s 聚合写盘从未生效。
+local ok_UIManager, UIManager = pcall(require, "ui/uimanager")
+
 local M = {
     _settings_ref = nil,  -- 与 settings 联动，用于持久化下载状态
     current_comic = nil,
@@ -20,6 +26,18 @@ local M = {
 }
 
 local DOWNLOAD_HISTORY_MAX = 10  -- 与用户确认：保留最近10条
+
+-- ============================================================
+-- ⚠️ 关于「未接线的访问器」：本模块是按**完整状态机 API** 设计的，当前实际只用到
+-- 其中一个子集。`lua_dead_code` 会把下面这批访问器报成「不可达」，但它们是**有意保留**的：
+--   getCurrentComic / getCurrentPage / getShelfVols / isShelfCacheValid / invalidateShelfCache /
+--   clearShelfVols / setPreDownloading / isPreDownloading / resetPreDownloadTriggered /
+--   clearDownloadHistory / clearProgressUploadTask / getProgressUploadTask / getLastReadTime /
+--   touchLastReadTime / getLastOpenVol
+-- 理由：它们是与上面这些状态字段一一对应的成对 get/set（set 与 is 拆散删除会破坏状态机
+-- 完整性），且体量极小（合计约 35 行）。逐个删除的维护收益远小于「日后要用时重新推演一遍
+-- 语义」的成本。**若确实要清理，请成组删除字段 + 访问器**，不要只删一半。
+-- ============================================================
 
 -- ============================================================
 -- 启动初始化：与 settings 联动，恢复下载状态
@@ -65,28 +83,32 @@ end
 -- Batch flush：延迟 3s 聚合写盘，避免下载中频繁 setDownloadTask/clearDownloadTask
 -- → 每一次都 s:flush() → settings 触发 setDirty → 局刷
 -- 3s 内把 N 次 task / history 更新聚合成 1 次写盘，有效减少局刷
-local _flush_scheduled = false
-local _dirty_since = 0
-local _FLUSH_DELAY = 3  -- 3 秒聚合窗口
+-- 【为什么用时间戳而不是布尔】scheduleIn 的回调在「退出 / 息屏」路径上可能被直接丢弃
+-- （KOReader 的 scheduleIn 基于 MONOTONIC 时钟且做息屏冻结，不补偿），布尔标志会永久
+-- 卡在 true → 此后 schedule_flush_later 一律提前 return → settings 再也不落盘，
+-- 所有改动只停在内存里直到进程结束（静默数据丢失）。
+-- 门控改为时间戳：只有「近期确实调度过」才跳过；超时未执行即视为回调已丢失，允许重排。
+local _flush_scheduled_at = 0   -- 0 = 未调度；否则为 os.time()
+local _FLUSH_DELAY = 3          -- 3 秒聚合窗口
+local _FLUSH_STALE = _FLUSH_DELAY * 3   -- 超过此时长仍未执行 → 视为调度已丢失
 local function schedule_flush_later()
-    _dirty_since = os.time()
-    if _flush_scheduled then return end
-    if not (type(UIManager) == "table" and UIManager.scheduleIn) then
+    if not (ok_UIManager and UIManager and UIManager.scheduleIn) then
         local s = M._settings_ref
         if s and s.flush then pcall(function() s:flush() end) end
         return
     end
-    _flush_scheduled = true
+    local now = os.time()
+    if _flush_scheduled_at > 0 and (now - _flush_scheduled_at) < _FLUSH_STALE then
+        return
+    end
+    _flush_scheduled_at = now
     UIManager:scheduleIn(_FLUSH_DELAY, function()
-        _flush_scheduled = false
+        _flush_scheduled_at = 0
         local s = M._settings_ref
         if not s then return end
-        -- 再检查一次：如果在 flush 前又有新的修改，再调度一次
-        local now = os.time()
-        if _dirty_since > 0 and (now - _dirty_since) < _FLUSH_DELAY then
-            -- 在窗口内还有修改，直接 flush 并重置窗口
-            _dirty_since = 0
-        end
+        -- 本回调执行即代表聚合窗口结束：窗口内累积的所有修改在下面一次性落盘。
+        -- （原注释写「如果在 flush 前又有新的修改，再调度一次」，但代码只是立刻 flush
+        -- —— 「延迟再调度」从未实现，实际行为就是「窗口到点即 flush」。此处只改注释。）
         if s.flush then
             local ok_f, err_f = pcall(function() s:flush() end)
             if not ok_f then

@@ -154,8 +154,14 @@ M.install = function()
         if not H.file_exists(css_file) then
             local f = io.open(css_file, "w")
             if f then
-                f:write(IMAGE_FILL_HEIGHT_CSS)
-                f:close()
+                -- 【write / close 都要查】失败时磁盘上留的是**截断的 CSS**，而这个文件会被
+                -- ReaderStyleTweak 当样式读走 —— 半截样式比没有样式更糟（静默生效一半）。
+                local w_ok, w_err = f:write(IMAGE_FILL_HEIGHT_CSS)
+                local c_ok, c_err = f:close()
+                if not w_ok or c_ok == nil then
+                    print("[KOOBONE] CSS 文件写入失败: " .. tostring(w_err or c_err))
+                    os.remove(css_file)
+                end
             end
         end
     end

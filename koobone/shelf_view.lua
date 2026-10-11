@@ -76,7 +76,38 @@ local confirm_delete_epub
 local on_sync_progress_manual
 local upload_vol_progress
 local show_download_progress
-local check_download_state
+
+-- ============================================================
+-- 【视图身份令牌】防异步回填串号
+-- ============================================================
+-- 与 reading 的 _detail_token 同一手法：在「打开某个界面 / 切到某个视图」时取一个自增号，
+-- 异步回调真正回填之前先比对，号变了就放弃此次回填。
+--
+-- 为什么需要：卷目录（show_series_chapter_dialog）是「先弹 loading → 异步拉目录 → 回填」
+-- 的两段式，而回填动作 ShelfView_update(menu, sid) 改的是**共享的** menu。于是存在真实的
+-- 串号场景：
+--   点系列 A 的「卷目录」（网络慢，1~3s）→ 返回 → 点系列 B 的「卷目录」（命中缓存秒开）
+--   → A 的结果姗姗来迟，把已经显示 B 卷目录的页面**替换成 A 的卷列表**。
+-- 数据不会串（闭包各自捕获自己的 sid），但「点的是 B、看到的是 A」是明确的错误。
+--
+-- 只在**视图目标真的变了**时自增（series_id 或 列表/卷视图层级变化），
+-- 这样「切换排序」「原地刷新」不会误伤正在加载的目录请求。
+local _view_token = 0
+
+local function _bump_view_token()
+    _view_token = _view_token + 1
+    return _view_token
+end
+
+local function _view_token_now()
+    return _view_token
+end
+
+-- 下载进度弹窗的身份令牌：同一时刻只允许「最后一个」弹窗刷新界面。
+-- 场景：已有一个进度弹窗在 0.3s/次轮询，用户又发起了另一个下载（新弹窗），
+-- 两个弹窗会同时画同一件事 —— 墨水屏上表现为两块区域交替闪烁。
+-- 取号方式与 _detail_token 一致：开新弹窗前自增，旧弹窗的轮询一比对就停。
+local _progress_dialog_token = 0
 
 local ShelfItem
 if ok_InputContainer then
@@ -273,10 +304,8 @@ end
 local ShelfMenu
 if ok_Menu then
     ShelfMenu = Menu:extend{
-        on_page_changed = nil,
         on_close_callback = nil,
         _koobone_closed = false,
-        _suppress_page_callback = false,
         _is_vol_view = false,   -- 当前是否在卷列表层
         _shelf_view_opts = nil, -- 纯函数式上下文表：{ plugin, series_id, skip_refresh, ... }
     }
@@ -310,20 +339,21 @@ if ok_Menu then
         UIManager:setDirty(self.show_parent, function()
             return "ui", old_dimen and old_dimen:combine(self.dimen) or self.dimen
         end)
-        if not self._suppress_page_callback and not self._koobone_closed and self.on_page_changed then
-            local page = tonumber(self.page) or 1
-            local first = (page - 1) * self.perpage + 1
-            local last = math.min(#self.item_table, first + self.perpage - 1)
-            UIManager:scheduleIn(0, function()
-                if not self._koobone_closed and self.on_page_changed then
-                    pcall(self.on_page_changed, page, first, last, self)
-                end
-            end)
-        end
     end
 
     function ShelfMenu:onCloseWidget()
         self._koobone_closed = true
+        -- 视图已关闭 → 作废所有在途的异步回填（token 比对失败即放弃）。
+        -- 这与下面的 cancel_tag 是两道互补的保险：token 管「已发出的回调不落地」，
+        -- cancel_tag 管「还没回来的请求直接掐掉」。
+        _bump_view_token()
+        -- 取消本视图发起的所有异步拉取（卷目录 / 封面）。
+        -- 这些流程的 timeout 最长 60s，不取消的话关掉书架后子进程仍在跑、网络仍在占用，
+        -- 最后还会回填到一个已经死掉的 menu 上。配套的 loading 对话框由
+        -- Async.run 的 opts.on_cancel 负责关闭（取消后 on_done 不再执行）。
+        if ok_Async and Async and Async.cancel_tag then
+            pcall(function() Async.cancel_tag("shelf") end)
+        end
         if self.on_close_callback then
             local callback = self.on_close_callback
             self.on_close_callback = nil
@@ -482,6 +512,9 @@ local function build_items(opts)
     if not series_list then return {} end
     for _idx, series in ipairs(series_list) do
         -- 系列封面：用伪 vol 结构（file_md5 = series_<id>）
+        -- ⚠️ 注意这个 `series_` 前缀是「封面文件名的伪 fmd」，与 bookshelf.lua 里
+        -- LOCAL_VOL_INDEX 的键 `"series:"..id`（用冒号）**是两套不同的命名空间**，
+        -- 前者拼进封面文件名、后者只是进度索引的 key —— 别把两者统一。
         -- check_cover_exists 只检查本地已有的，不触发下载（异步下载 trigger_cover_download 做）
         local cover_path = nil
         if series.cover_url and series.cover_url ~= "" then
@@ -544,9 +577,7 @@ local function refresh_current(menu)
         current_first_index = math.max(1, #items - perpage + 1)
         if current_first_index < 1 then current_first_index = 1 end
     end
-    menu._suppress_page_callback = true
     menu:switchItemTable(nil, items, current_first_index)
-    menu._suppress_page_callback = false
 end
 
 -- ============================================================
@@ -646,7 +677,9 @@ local function trigger_cover_download(opts, menu)
                 if not menu._koobone_closed and ok_UIManager then
                     UIManager:scheduleIn(0.05, download_next)
                 end
-            end, { timeout = 45, poll_interval = 0.3 })
+                -- tag=shelf：书架菜单关闭时取消这张封面的下载（timeout 45s，
+                -- 不取消的话关掉书架后子进程还会继续跑）。无 loading 界面，故不需要 on_cancel。
+            end, { timeout = 45, poll_interval = 0.3, tag = "shelf" })
             return
         else
             -- 本地已有 → 回填内存缓存即可。如果内存里没有，说明是重启后首次加载，
@@ -697,16 +730,23 @@ local function refresh_shelf(opts, menu)
             busy = nil
         end
     end
-    busy = InfoMessage:new{ text = _t("正在刷新书架..."), timeout = 0 }
+    -- 【不要写 timeout = 0】KOReader 的 InfoMessage:onShow 是 `if self.timeout then
+    -- UIManager:scheduleIn(self.timeout, close) end`，而 Lua 里 0 为真 → 传 0 等于
+    -- 「排一个 0 秒后的关闭定时器」= 弹出即消失。一次刷新最长 120s（含重试退避），
+    -- 用户在整段时间里看不到任何反馈。这里不设 timeout，交给 on_done / on_cancel 主动关。
+    busy = InfoMessage:new{ text = _t("正在刷新书架...") }
     UIManager:show(busy)
     -- showBusy 之后立刻 forceRePaint，保证 busy 对话框先画出来
     -- Async.run 放到下一个 tick（scheduleIn 0），避免 fork 子进程前 paint 队列被卡住
     if ok_UIManager then pcall(function() UIManager:forceRePaint() end) end
     if not ok_Async then
-        do_close_busy()
+        -- 同步降级：refresh 会在 UI 线程一路跑完（阻塞），此时 busy 已经 forceRePaint 过，
+        -- 留着它当「卡住但至少知道在做事」的提示；跑完再关（原先在调用前就关掉，
+        -- 于是阻塞期间屏幕上什么都没有）。
         local ok, result_or_err = pcall(function()
             return plugin_ref.bookshelf and plugin_ref.bookshelf:refresh(true)
         end)
+        do_close_busy()
         if not ok then
             UIManager:show(InfoMessage:new{
                 text = T(_t("刷新失败:\n%1"), tostring(result_or_err)),
@@ -726,6 +766,12 @@ local function refresh_shelf(opts, menu)
     end
     -- 下一个 tick 再 fork 子进程，让 busy 先渲染
     UIManager:scheduleIn(0, function()
+        -- 这一 tick 之间菜单可能已被关掉（此时 cancel_tag("shelf") 早已跑过、但本句柄
+        -- 还没登记，取消不到）→ 直接放弃并收掉 busy，不做无谓的网络刷新。
+        if menu and menu._koobone_closed then
+            do_close_busy()
+            return
+        end
         Async.run(function()
             if plugin_ref.bookshelf then
                 return plugin_ref.bookshelf:refresh(true)
@@ -756,7 +802,14 @@ local function refresh_shelf(opts, menu)
             end
             -- 成功：动态更新当前菜单内容（保持页码/焦点）
             refresh_current(menu)
-        end, { timeout = 120, poll_interval = 0.3 })
+        end, {
+            timeout = 120,
+            poll_interval = 0.3,
+            -- 取消路径（菜单关闭 → cancel_tag("shelf")；退出 → cancel_all）不会执行
+            -- on_done，busy 必须在这里关，否则墨水屏永久残留「正在刷新书架...」。
+            tag = "shelf",
+            on_cancel = do_close_busy,
+        })
     end)
 end
 
@@ -887,7 +940,19 @@ show_series_action_dialog = function(opts, menu, series)
                     UIManager:show(InfoMessage:new{ text = _t("打开失败：") .. tostring(err_open or ""), timeout = 3 })
                 end
             end
-        end, { timeout = 60, poll_interval = 0.3 })
+        end, {
+            timeout = 60,
+            poll_interval = 0.3,
+            -- 【取消路径必须自己收尾】Async 被取消时 on_done 不再执行（async.lua 的 poll
+            -- 首行 `if handle._cancelled then return end`），所以「正在加载卷列表...」
+            -- 只能在 on_cancel 里关。tag 与其它书架流程保持一致：菜单关闭时由
+            -- ShelfMenu:onCloseWidget 的 cancel_tag("shelf") 掐掉，否则墨水屏上会
+            -- 永久残留 loading（等于假死）。
+            tag = "shelf",
+            on_cancel = function()
+                if loading_msg then pcall(function() UIManager:close(loading_msg) end) end
+            end,
+        })
     end
 
     dlg = ButtonDialog:new{
@@ -980,7 +1045,7 @@ show_series_chapter_dialog = function(opts, menu, series)
                     else
                         Log.warn("目录后台刷新失败: series=", sid, "err=", tostring(err_r))
                     end
-                end, { timeout = 60, poll_interval = 0.5 })
+                end, { timeout = 60, poll_interval = 0.5, tag = "shelf" })
             end)
         end
         return
@@ -993,6 +1058,8 @@ show_series_chapter_dialog = function(opts, menu, series)
         UIManager:show(InfoMessage:new{ text = _t("目录加载未就绪"), timeout = 2 })
         return
     end
+    -- 【身份令牌】进异步前取号，回填前比对（见 _view_token 的说明）
+    local view_token = _view_token_now()
     local loading_msg = InfoMessage:new{ text = _t("正在加载目录...") }
     UIManager:show(loading_msg)
     UIManager:scheduleIn(0, function()
@@ -1000,6 +1067,12 @@ show_series_chapter_dialog = function(opts, menu, series)
             return bookshelf:get_series_vols(sid, { force = true })
         end, function(ok_run, vols, err)
             pcall(function() UIManager:close(loading_msg) end)
+            -- 【身份校验】加载期间用户已切走（换系列 / 返回书架）→ 放弃本次回填，
+            -- 否则会把 A 的卷列表贴到 B 的页面上（「点的是 B、看到的是 A」）。
+            if _view_token_now() ~= view_token then
+                Log.info("卷目录加载完成但视图已切换，放弃回填 series=", sid)
+                return
+            end
             if not ok_run or not vols or #vols == 0 then
                 UIManager:show(InfoMessage:new{
                     text = T(_t("目录加载失败:\n%1"), tostring(err or vols or _t("无数据"))),
@@ -1008,7 +1081,16 @@ show_series_chapter_dialog = function(opts, menu, series)
                 return
             end
             switch_to_vol_view()
-        end, { timeout = 60, poll_interval = 0.3 })
+        end, {
+            timeout = 60,
+            poll_interval = 0.3,
+            -- 菜单关闭时取消本次拉取。被取消时 on_done 不会再执行，
+            -- 所以「正在加载目录...」必须在这里关掉，否则界面永久卡在 loading。
+            tag = "shelf",
+            on_cancel = function()
+                pcall(function() UIManager:close(loading_msg) end)
+            end,
+        })
     end)
 end
 
@@ -1421,8 +1503,12 @@ on_sync_progress_manual = function(opts, menu, vol)
     local cur_fmd = vol.file_md5 or vol.fmd or ""
     local cur_reader_fmd = reader.current_vol and (reader.current_vol.file_md5 or reader.current_vol.fmd or "")
     if tostring(cur_reader_fmd) ~= "" and tostring(cur_fmd) == tostring(cur_reader_fmd) then
-        local last_page = reader.current_page_index or 0
-        local total_pages = reader.total_pages or 0
+        -- Reader:get_progress() 返回当前会话页码/总页数。
+        -- （此前读的是并不存在的 reader.current_page_index / reader.total_pages，永远取到 0）
+        local last_page, total_pages = 0, 0
+        if reader.get_progress then
+            last_page, total_pages = reader:get_progress()
+        end
         upload_vol_progress(opts, menu, vol, { last_page = last_page, total_pages = total_pages })
         return
     end
@@ -1451,31 +1537,32 @@ upload_vol_progress = function(opts, menu, vol, progress)
         UIManager:show(InfoMessage:new{ text = _t("上传失败：卷信息缺失"), timeout = 3 })
         return
     end
-    if not ok_Async then
-        local ok_up, err_up = pcall(function()
-            return client:upload_progress(fmd, last_page, total_pages)
-        end)
-        if ok_up then
+
+    -- 统一结果处理。client:upload_progress 返回 (ok, msg)；
+    -- 外层 pcall 只表示"调用没抛异常"，不能当成上传成功。
+    local function report(ok_run, ok_up, msg)
+        if ok_run and ok_up then
             UIManager:show(InfoMessage:new{ text = _t("云端进度已更新"), timeout = 2 })
         else
             UIManager:show(InfoMessage:new{
-                text = T(_t("上传失败:\n%1"), tostring(err_up)),
+                text = T(_t("上传失败:\n%1"), tostring(msg or "未知错误")),
                 timeout = 3,
             })
         end
+    end
+
+    if not ok_Async then
+        local ok_run, ok_up, msg = pcall(function()
+            return client:upload_progress(fmd, last_page, total_pages)
+        end)
+        report(ok_run, ok_up, msg)
         return
     end
     Async.run(function()
-        return client:upload_progress(fmd, last_page, total_pages)
-    end, function(ok_up, result, err_up)
-        if ok_up then
-            UIManager:show(InfoMessage:new{ text = _t("云端进度已更新"), timeout = 2 })
-        else
-            UIManager:show(InfoMessage:new{
-                text = T(_t("上传失败:\n%1"), tostring(result or err_up)),
-                timeout = 3,
-            })
-        end
+        local ok_up, msg = client:upload_progress(fmd, last_page, total_pages)
+        return { ok = ok_up == true, msg = tostring(msg or "") }
+    end, function(ok_run, result, err_run)
+        report(ok_run, result and result.ok, (result and result.msg) or err_run)
     end, { timeout = 30, poll_interval = 0.3 })
 end
 
@@ -1490,6 +1577,11 @@ show_download_progress = function(opts, menu, vol, plugin_dl_task)
     local fmd = tostring(vol and (vol.file_md5 or vol.fmd) or "")
     local vol_title = tostring(vol and vol.title or vol.vol_name or fmd:sub(1, 8))
 
+    -- 【弹窗身份令牌】开新弹窗前取号；本弹窗的所有刷新 / 轮询都要先比对它，
+    -- 号变了说明已被更新的弹窗取代 → 自己停下（见 _progress_dialog_token 说明）。
+    _progress_dialog_token = _progress_dialog_token + 1
+    local dlg_token = _progress_dialog_token
+
     -- 创建下载进度条 Widget（fanqie 同款：ProgressWidget + 百分比 + 后台/取消按钮）
     local dlg = ok_DLProgress_module:new{
         title = T(_t("下载中：%1"), vol_title),
@@ -1498,10 +1590,22 @@ show_download_progress = function(opts, menu, vol, plugin_dl_task)
     dlg._visible = true
     UIManager:show(dlg)
     state.setProgressUploadTask(nil)
-    state.progress_upload_task = { cancel_flag = false }
+    -- 本次下载的取消标志。通过 state 的访问器而不是直接写 state.progress_upload_task 裸字段，
+    -- 避免绕过模块 API（该槽位历史上被复用作"下载取消 flag"，语义已偏，用局部引用更清晰）。
+    local cancel_flag_ref = { cancel_flag = false }
+    state.setProgressUploadTask(cancel_flag_ref)
+
+    -- ⚠️ 这两个守卫必须在下面所有闭包**之前**声明：Lua 的 local 从声明语句之后才可见，
+    -- 若放在 dlg.on_background / on_cancel 之后，闭包写的就是**全局** _stop / dlg_closed，
+    -- 而 poll_progress_once 读的是局部 → "后台运行/取消"停不掉轮询（界面已关但 0.3s 空转）。
+    local _stop = false       -- 轮询停止守卫：done/err/cancel/用户手动关 → true，防止无限 scheduleIn
+    local dlg_closed = false
+
     local function on_cancel_clicked()
-        state.progress_upload_task.cancel_flag = true
+        cancel_flag_ref.cancel_flag = true
         if plugin.download and fmd ~= "" then
+            -- 统一取消入口（download.lua Download:cancel）：pending 直接出队，
+            -- 下载中写 IPC cancel.flag 让子进程中止。
             pcall(function() plugin.download:cancel(fmd) end)
         end
     end
@@ -1524,11 +1628,10 @@ show_download_progress = function(opts, menu, vol, plugin_dl_task)
         end)
         if ok_paths then ipc_paths = p end
     end
-    local cancel_flag_ref = state.progress_upload_task
-    local _stop = false   -- 轮询停止守卫：done/err/cancel/用户手动关 → true，防止无限 scheduleIn
-    local dlg_closed = false
     local function do_show_update(state_table)
         if dlg_closed or not dlg then return end
+        -- 【身份校验】已被更新的弹窗取代 → 绝不再动界面
+        if _progress_dialog_token ~= dlg_token then return end
         pcall(function() dlg:setState(state_table) end)
     end
     local function close_dlg()
@@ -1556,6 +1659,13 @@ show_download_progress = function(opts, menu, vol, plugin_dl_task)
     end
     local function poll_progress_once()
         if _stop then return end   -- 任何路径触发了停止，直接 return，不再调度下一次
+        -- 【身份校验】本弹窗已被更新的弹窗取代 → 停轮询（否则两个弹窗同时刷屏）
+        if _progress_dialog_token ~= dlg_token then
+            _stop = true
+            dlg_closed = true
+            Log.info("[Koobone] 下载进度弹窗已被新弹窗取代，停止旧弹窗轮询")
+            return
+        end
         if cancel_flag_ref and cancel_flag_ref.cancel_flag then
             _stop = true
             do_show_update({ stage = "cancelled", vol_name = vol_title, current = 0, total = 1, percent = 0 })
@@ -1645,21 +1755,6 @@ show_download_progress = function(opts, menu, vol, plugin_dl_task)
     local tot0 = plugin_dl_task and plugin_dl_task.total or 0
     do_show_update({ stage = "prepare", vol_name = vol_title, current = cur0, total = tot0, download_bytes = cur0, expected_size = tot0 })
     UIManager:scheduleIn(0.3, poll_progress_once)
-end
-
--- 向前兼容：检查 download 模块中是否有此任务（用于进度 UI 去重）
-check_download_state = function(opts, menu, vol)
-    local plugin = opts and opts.plugin
-    if not plugin then return end
-    local t = state.getDownloadTask()
-    if not t then return false end
-    local tfmd = tostring(t.file_md5 or t.fmd or "")
-    local vfmd = tostring(vol.file_md5 or vol.fmd or "")
-    if tfmd == vfmd and not t.finished then
-        show_download_progress(opts, menu, vol, t)
-        return true
-    end
-    return false
 end
 
 -- ============================================================
@@ -1757,22 +1852,6 @@ if ShelfMenu then
         end
         Menu.onClose(self)
     end
-
-    function ShelfMenu:shelf_close_cb()
-        return self:onClose()
-    end
-
-    function ShelfMenu:onPageChanged(page, first, last, current)
-        if self._suppress_page_callback then return end
-        if self.on_page_changed then
-            local ok_cb = pcall(self.on_page_changed, page, first, last, current)
-            if not ok_cb then
-                Menu.onPageChanged(self, page, first, last, current)
-            end
-            return
-        end
-        Menu.onPageChanged(self, page, first, last, current)
-    end
 end
 
 -- ============================================================
@@ -1861,7 +1940,16 @@ function ShelfView_show(opts_in)
                             Log.warn("目录刷新失败: ", tostring(err_r))
                             UIManager:show(InfoMessage:new{ text = _t("刷新失败"), timeout = 2 })
                         end
-                    end, { timeout = 60, poll_interval = 0.3 })
+                    end, {
+                        timeout = 60,
+                        poll_interval = 0.3,
+                        -- 同 show_series_action_dialog 处：取消后 on_done 不执行，
+                        -- 「正在刷新目录...」必须在 on_cancel 里关掉。
+                        tag = "shelf",
+                        on_cancel = function()
+                            pcall(function() UIManager:close(loading) end)
+                        end,
+                    })
                 end
             else
                 -- 不 force 时只是刷新 UI（从缓存取最新数据）
@@ -1870,14 +1958,14 @@ function ShelfView_show(opts_in)
         else
             -- 书架视图：刷新书架数据
             if force_api then
-                local ok_rf, result_rf = pcall(function() return rbookshelf:refresh(true) end)
-                if ok_rf and type(result_rf) == "table" and result_rf.series then
-                    pcall(function()
-                        rbookshelf:apply_refresh_result(result_rf)
-                    end)
-                end
+                -- 【不要在 UI 线程同步 refresh】refresh 内部走 client:request
+                -- （3 次重试 + 每次 15s 超时 + socket.sleep 退避），在这里直接 pcall 调用
+                -- 会把界面冻住数秒到十几秒。refresh_shelf 已经是「busy 提示 + Async.run
+                -- 子进程 + apply_refresh_result 回填」的完整实现，直接复用（顺带去掉一份重复）。
+                refresh_shelf(ropts or opts, menu_to_refresh)
+            else
+                refresh_current(menu_to_refresh)
             end
-            refresh_current(menu_to_refresh)
         end
     end
 
@@ -1894,9 +1982,6 @@ function ShelfView_show(opts_in)
         on_close_callback = function()
             -- 标记关闭：后续下载回调 refresh_current() 会看到此标记，不再触发 setDirty 局刷
             menu._koobone_closed = true
-            if plugin and plugin._shelf_menu_closed_callback then
-                pcall(plugin._shelf_menu_closed_callback)
-            end
         end,
         -- 右上角刷新按钮回调
         on_confirm_callback = function()
@@ -1917,6 +2002,10 @@ function ShelfView_show(opts_in)
     Log.info("[Koobone] ShelfMenu created, is_vol_view=", tostring(is_vol_view))
 
     UIManager:show(menu)
+    -- 新视图：作废上一视图在途的异步回填（见 _view_token 的说明）。
+    -- 注意必须在 show 之后、trigger_cover_download 之前自增，
+    -- 否则这次 show 发起的封面/目录请求会被自己刚自增的号误杀。
+    _bump_view_token()
     -- 菜单显示后异步下载缺失封面（不阻塞 UI）
     pcall(function() trigger_cover_download(opts, menu) end)
     return menu
@@ -1951,6 +2040,15 @@ function ShelfView_update(menu, new_opts_in)
     local series_id = merged.series_id
     local new_is_vol = series_id ~= nil and series_id ~= ""
 
+    -- 【视图身份令牌】只有**目标视图**真的变了才自增：换系列（sid 变化）或
+    -- 列表视图 ⇄ 卷视图 层级切换，都意味着「之前在途的目录请求已不再对应现在这个页面」，
+    -- 必须作废（否则会把它回填到新页面上）。排序变化 / 原地刷新（sid 不变）
+    -- 不应误伤正在加载的请求 —— 所以这里不用「每次 update 都自增」的粗粒度做法。
+    if tostring(old_opts and old_opts.series_id or "") ~= tostring(series_id or "")
+        or new_is_vol ~= menu._is_vol_view then
+        _bump_view_token()
+    end
+
     -- 保存当前页码作为 switchItemTable 定位依据
     local current_page = tonumber(menu.page) or 1
     local perpage = menu.perpage or 8
@@ -1983,9 +2081,7 @@ function ShelfView_update(menu, new_opts_in)
     merged._menu = menu
     menu._shelf_view_opts = merged
 
-    menu._suppress_page_callback = true
     menu:switchItemTable(nil, new_items, current_first_index)
-    menu._suppress_page_callback = false
     -- 菜单更新后异步下载缺失封面（不阻塞 UI）
     pcall(function() trigger_cover_download(merged, menu) end)
     return menu

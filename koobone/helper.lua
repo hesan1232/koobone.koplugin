@@ -4,6 +4,12 @@ local Log = require("koobone.logger")
 
 local H = {}
 
+-- 统一 User-Agent（唯一来源）。
+-- 此前 client.lua / http_downloader.lua 各写了一份一模一样的字面量，koobone.lua 里还有
+-- 第三份且版本号不同（Chrome/150）——那份 `Koobone.USER_AGENT` 全仓无人读取，已删。
+-- 改 UA 属对外行为变更（服务器可能按 UA 分流），所以这里保持原有的 Chrome/120 不变。
+H.DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
 function H.make_dir(path)
     if not path or path == "" then return end
     if H.dir_exists(path) then return end
@@ -71,9 +77,6 @@ function H.is_str(value)
     return type(value) == "string"
 end
 
-function H.is_tbl(value)
-    return type(value) == "table"
-end
 
 function H.trim(str)
     if not str then return "" end
@@ -94,15 +97,27 @@ function H.url_encode(str)
     end))
 end
 
+-- json 后端只探测一次（模块级缓存）。
+-- 原实现在 json_decode / json_encode 里每次调用都 `pcall(require, "json")`，而这两个函数
+-- 正处在 IPC 进度热路径上（主进程每 0.3s 读一次进度文件），每次 require 都要走一遍
+-- package.loaded 查表 + pcall 开销。
+local _json_backend   -- nil = 未探测；false = 探测失败；否则为模块表
+local function json_backend()
+    if _json_backend == nil then
+        local ok, mod = pcall(require, "json")
+        if not ok then
+            ok, mod = pcall(require, "rapidjson")
+        end
+        _json_backend = ok and mod or false
+    end
+    return _json_backend or nil
+end
+
 function H.json_decode(str)
     if not str then return nil end
 
-    local ok, json = pcall(require, "json")
-    if not ok then
-        ok, json = pcall(require, "rapidjson")
-    end
-
-    if ok then
+    local json = json_backend()
+    if json then
         local ok2, result = pcall(json.decode, str)
         if ok2 then
             return result
@@ -116,12 +131,8 @@ end
 function H.json_encode(obj)
     if not obj then return nil end
 
-    local ok, json = pcall(require, "json")
-    if not ok then
-        ok, json = pcall(require, "rapidjson")
-    end
-
-    if ok then
+    local json = json_backend()
+    if json then
         local ok2, result = pcall(json.encode, obj)
         if ok2 then
             return result
@@ -132,108 +143,6 @@ function H.json_encode(obj)
     return nil
 end
 
-function H.download_file(url, save_path)
-    return H.download_file_with_headers(url, save_path, {})
-end
-
-function H.download_file_with_headers(url, save_path, headers)
-    local ltn12 = require("ltn12")
-    local default_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-    url = H.trim(url):gsub("\n", ""):gsub("\r", "")
-
-    Log.debug("下载文件: " .. url .. " -> " .. save_path)
-
-    local file = io.open(save_path, "wb")
-    if not file then
-        Log.error("无法打开文件: " .. save_path)
-        return false, "无法打开文件: " .. save_path
-    end
-
-    local is_https = url:find("^https://") == 1
-    local http_module
-
-    if is_https then
-        local ok_ssl, ssl = pcall(require, "ssl.https")
-        if ok_ssl then
-            http_module = ssl
-        else
-            file:close()
-            Log.warn("HTTPS不可用，无法下载文件: " .. url)
-            return false, "SSL不可用"
-        end
-    else
-        http_module = require("socket.http")
-    end
-
-    local request_options = {
-        url = url,
-        sink = ltn12.sink.file(file),
-        timeout = 30,
-        headers = {
-            ["User-Agent"] = default_ua,
-            ["Referer"] = url:match("^(https?://[^/]+)") or "",
-        },
-    }
-
-    for key, value in pairs(headers or {}) do
-        request_options.headers[key] = value
-    end
-
-    local result, status = http_module.request(request_options)
-
-    if status ~= 200 then
-        H.delete_file(save_path)
-        Log.error("HTTP请求失败: " .. tostring(status))
-        return false, "HTTP请求失败: " .. tostring(status)
-    end
-
-    Log.debug("下载成功")
-    return true
-end
-
-function H.download_string(url)
-    local ltn12 = require("ltn12")
-    local default_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-    Log.debug("下载字符串: " .. url)
-
-    local data = {}
-
-    local is_https = url:find("^https://") == 1
-    local http_module
-
-    if is_https then
-        local ok_ssl, ssl = pcall(require, "ssl.https")
-        if ok_ssl then
-            http_module = ssl
-        else
-            Log.warn("HTTPS不可用，无法下载字符串: " .. url)
-            return nil, "SSL不可用"
-        end
-    else
-        http_module = require("socket.http")
-    end
-
-    local request_options = {
-        url = url,
-        sink = ltn12.sink.table(data),
-        timeout = 30,
-        headers = {
-            ["User-Agent"] = default_ua,
-            ["Referer"] = url:match("^(https?://[^/]+)") or "",
-        },
-    }
-
-    local result, status = http_module.request(request_options)
-
-    if status ~= 200 then
-        Log.error("HTTP请求失败: " .. tostring(status))
-        return nil, "HTTP请求失败: " .. tostring(status)
-    end
-
-    return table.concat(data)
-end
 
 function H.file_size(path)
     local size = lfs.attributes(path, "size")
@@ -256,9 +165,6 @@ function H.get_epub_dir()
     return H.get_data_dir() .. "/epub"
 end
 
-function H.get_pages_dir()
-    return H.get_cache_dir() .. "/pages"
-end
 
 -- ============================================================
 -- EPUB 缓存文件名生成（统一入口，供 download/bookshelf/shelf_view 共用）
@@ -371,58 +277,11 @@ end
 -- 路径 / URL 工具
 -- ============================================================
 
-function H.path_normalize(p)
-    if not p then return "" end
-    p = p:gsub("\\", "/")
-    local parts = {}
-    for part in p:gmatch("([^/]+)") do
-        if part == ".." then
-            if #parts > 0 then
-                table.remove(parts)
-            end
-        elseif part ~= "." and part ~= "" then
-            table.insert(parts, part)
-        end
-    end
-    local result = table.concat(parts, "/")
-    if p:sub(1, 1) == "/" then
-        result = "/" .. result
-    end
-    return result
-end
-
-function H.join_url(base, rel)
-    if not rel or rel == "" then return "" end
-    if rel:find("^%a+://") then return rel end
-    if rel:sub(1, 1) == "/" then
-        local scheme_host = base:match("^(https?://[^/]+)") or ""
-        return scheme_host .. rel
-    end
-    local base_dir = base:match("^(.*)/[^/]*$") or base
-    return H.path_normalize(base_dir .. "/" .. rel)
-end
-
-function H.read_file_text(path)
-    local f = io.open(path, "rb")
-    if not f then return nil end
-    local data = f:read("*all")
-    f:close()
-    if not data then return nil end
-    local ok_txt, txt = pcall(function()
-        return data:gsub("\0", "")
-    end)
-    if ok_txt then return txt end
-    return data
-end
 
 -- ============================================================
 -- 文件系统工具
 -- ============================================================
 
-function H.file_mtime(path)
-    local mtime = lfs.attributes(path, "modification")
-    return mtime or 0
-end
 
 function H.safe_rmtree(dir)
     H.delete_dir(dir)
@@ -517,6 +376,87 @@ function H.lru_cleanup(cache_dir, opts)
     if not ok then
         Log.warn("[KooboneCache] LRU cleanup exception:", tostring(err))
     end
+end
+
+-- ============================================================
+-- ZIP 解压（纯 Lua，走 KOReader 自带的 ffi/archiver）
+-- ============================================================
+
+--- 把 zip 解压到 dest_dir。
+---
+--- 【为什么不调系统 `unzip` 命令】设备上不保证有它（Kindle 的 busybox 就没有），
+--- 而 `ffi/archiver` 是 KOReader 自带的 libarchive 绑定，各平台都有。插件自更新依赖
+--- 本函数完成「解压更新包」这一步，所以这里必须做到零外部命令依赖。
+---
+--- 【路径穿越防护】zip 条目名是攻击面（`../../x` 这类）。这里做两层检查：一是条目
+--- 名里不允许出现 `..`，二是拼接后的绝对路径必须仍落在 dest_dir 之内。
+---
+--- 与 reading 的同名实现（reading/helper.lua）保持同一套语义。
+---
+--- @param zip_path string
+--- @param dest_dir string
+--- @return true | false, string 原因
+function H.unzip_file(zip_path, dest_dir)
+    Log.debug("解压文件: " .. tostring(zip_path) .. " -> " .. tostring(dest_dir))
+
+    local ok, Archiver = pcall(require, "ffi/archiver")
+    if not ok or not Archiver then
+        Log.error("无法加载 ffi/archiver")
+        return false, "无法加载 archiver 库"
+    end
+
+    local arc = Archiver.Reader:new()
+    if not arc:open(zip_path) then
+        Log.error("无法打开 zip 文件: " .. tostring(zip_path))
+        return false, "无法打开 zip 文件"
+    end
+
+    local norm_dest = tostring(dest_dir):gsub("[/\\]+$", "")
+    H.make_dir(dest_dir)
+
+    for entry in arc:iterate() do
+        local raw_entry = entry.path
+        if raw_entry:find("%.%.") then
+            Log.warn("跳过疑似路径穿越的条目: " .. tostring(raw_entry))
+        else
+            local entry_path = H.join_path(dest_dir, raw_entry)
+            if entry_path:sub(1, #norm_dest) ~= norm_dest then
+                Log.warn("跳过逃逸目标目录的条目: " .. tostring(raw_entry))
+            elseif entry.mode == "directory" then
+                H.make_dir(entry_path)
+            elseif entry.mode == "file" then
+                local parent_dir = entry_path:match("^(.*)[/\\]")
+                if parent_dir then
+                    H.make_dir(parent_dir)
+                end
+
+                local content = arc:extractToMemory(entry.path)
+                if content then
+                    local file, open_err = io.open(entry_path, "wb")
+                    if file then
+                        -- ⚠️ write / close 的返回值都要查：Lua stdio 带缓冲，磁盘写满时
+                        -- write 往往不报错，错误要到 close 才暴露。只看 open 成功会留下
+                        -- 一个「打开成功、内容截断」的文件，后面被当成完整文件使用。
+                        local write_ok, write_err = file:write(content)
+                        local close_ok, close_err = file:close()
+                        if not write_ok or close_ok == nil then
+                            Log.warn("解压写入失败，已删除半截文件: " .. entry_path
+                                .. " (" .. tostring(write_err or close_err) .. ")")
+                            os.remove(entry_path)
+                        end
+                    else
+                        Log.warn("无法创建文件: " .. entry_path .. " (" .. tostring(open_err) .. ")")
+                    end
+                else
+                    Log.warn("无法提取文件内容: " .. tostring(raw_entry))
+                end
+            end
+        end
+    end
+
+    arc:close()
+    Log.debug("解压完成: " .. tostring(dest_dir))
+    return true
 end
 
 return H

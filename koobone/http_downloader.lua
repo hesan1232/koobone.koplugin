@@ -1,17 +1,22 @@
-local ltn12 = require("ltn12")
 local H = require("koobone.helper")
 local Log = require("koobone.logger")
 local _state = require("koobone.state")
 
+-- lfs 必须显式 require：KOReader 不提供全局 lfs（全仓库其余模块都是
+-- `local lfs = require("libs/libkoreader-lfs")`）。此前裸用 `lfs.attributes`，
+-- 在无全局 lfs 的环境会抛 "attempt to index a nil value (global 'lfs')"，
+-- 使断点续传的"已有字节数"检测直接失败。
+local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+
+-- 注：`ssl` / `socket.tcp` 曾在此 require，供已删除的 keep-alive 连接工厂
+-- （create_socket_factory）使用；下载主路径走 pick_transport，不需要它们。
 local ok_https, https = pcall(require, "ssl.https")
 local ok_http, http = pcall(require, "socket.http")
 local ok_socket_perf, socket_perf = pcall(require, "socket")
-local ok_ssl, ssl = pcall(require, "ssl")
-local ok_tcp, tcp = pcall(require, "socket.tcp")
 
 local M = {}
 
-local DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+local DESKTOP_UA = H.DESKTOP_UA
 
 function M.now_ms()
     if ok_socket_perf and socket_perf and socket_perf.gettime then
@@ -20,29 +25,29 @@ function M.now_ms()
     return os.clock() * 1000
 end
 
-function M.clamp(v, lo, hi)
-    v = tonumber(v) or lo
-    if v < lo then return lo end
-    if v > hi then return hi end
-    return v
+-- 关闭文件句柄（容错版）。
+-- 取消路径会在 sink 里先 close 一次，之后外层还会再 close；而 Lua 5.1/LuaJIT 对
+-- 已关闭句柄调用 f:close() 会抛 "attempt to use a closed file"，把它抛出
+-- 函数外部会掩盖真正的取消原因。这里统一走 pcall。
+local function close_quietly(f)
+    if not f then return end
+    pcall(function() f:close() end)
 end
 
-function M.format_size(bytes)
-    bytes = tonumber(bytes) or 0
-    if bytes < 1024 then
-        return string.format("%dB", math.floor(bytes))
-    elseif bytes < 1024 * 1024 then
-        return string.format("%.1fKB", bytes / 1024)
-    elseif bytes < 1024 * 1024 * 1024 then
-        return string.format("%.1fMB", bytes / (1024 * 1024))
-    else
-        return string.format("%.1fGB", bytes / (1024 * 1024 * 1024))
-    end
-end
+-- 下载 sink 的速率检测参数。
+-- ⚠️ 它检测的不是「完全停住」—— 那种情况 sink 根本不会被调用，由 request_options.timeout
+-- 兜底。它检测的是「还在滴数据、但慢到不可用」：没有这一步，一条 200 B/s 的连接会把
+-- 180s 的 timeout 全部耗完才算失败（墨水屏上表现为进度条卡着不动很久）。
+local STALL_MS = 15000      -- 统计窗口
+local MIN_RATE = 1024       -- bytes/s，低于此速率视为停滞
 
 -- ============================================================
 -- IPC: 子进程→父进程进度传递（基于文件）
 -- ============================================================
+
+-- 进度写入失败只告警一次：本函数在下载过程中每个进度 tick 都会被调用，
+-- 若磁盘满 / 句柄失效，逐 tick 告警会把日志刷爆。
+local _ipc_progress_warned = false
 
 function M.ipc_write_progress(file_path, data)
     if not file_path then return end
@@ -52,8 +57,19 @@ function M.ipc_write_progress(file_path, data)
         local tmp = file_path .. ".tmp"
         local f = io.open(tmp, "w")
         if not f then return end
-        f:write(json_str)
-        f:close()
+        -- ⚠️ 返回值必须检查：写失败时下面那句 os.rename 仍可能成功，父进程会读到一个
+        -- 空/截断的进度 JSON（表现为进度条不动），而没有任何错误线索。
+        local write_ok, write_err = f:write(json_str)
+        local close_ok, close_err = f:close()
+        if not write_ok or close_ok == nil then
+            if not _ipc_progress_warned then
+                _ipc_progress_warned = true
+                Log.warn("[Koobone] 进度写入失败（后续不再重复告警）: "
+                    .. tostring(write_err or close_err))
+            end
+            pcall(os.remove, tmp)
+            return
+        end
         os.rename(tmp, file_path)
     end)
 end
@@ -68,12 +84,31 @@ function M.ipc_read_progress(file_path)
     return H.json_decode(content)
 end
 
+-- 父进程发送取消信号
+-- @return boolean 是否确认写入成功。此前无返回值，调用方即使写失败也当作已发送
+--         ——「用户点了取消，子进程照跑」就是这么来的。
 function M.ipc_write_cancel(cancel_file)
-    if not cancel_file then return end
-    pcall(function()
-        local f = io.open(cancel_file, "w")
-        if f then f:write("1"); f:close() end
+    if not cancel_file then return false end
+    local pcall_ok, written = pcall(function()
+        local f, open_err = io.open(cancel_file, "w")
+        if not f then
+            Log.warn("[Koobone] 取消信号无法创建: " .. tostring(open_err))
+            return false
+        end
+        -- ⚠️ 返回值必须检查：这里写不进去 = 取消信号丢失。
+        local write_ok, write_err = f:write("1")
+        local close_ok, close_err = f:close()
+        if not write_ok or close_ok == nil then
+            Log.warn("[Koobone] 取消信号写入失败: " .. tostring(write_err or close_err))
+            return false
+        end
+        return true
     end)
+    if not pcall_ok then
+        Log.warn("[Koobone] 取消信号写入异常: " .. tostring(written))
+        return false
+    end
+    return written == true
 end
 
 function M.ipc_check_cancel(cancel_file)
@@ -166,175 +201,11 @@ end
 -- Keep-Alive: 创建可复用的 socket 连接
 -- ============================================================
 
--- 创建一个持久的连接工厂，用于在多个请求间复用 TCP 连接
--- 这避免了每次请求都进行 TCP 握手 + TLS 协商的固定开销
--- 注意: 依赖 socket.tcp 和 ssl 模块，如果不可用则返回 nil
-local function create_socket_factory(url, is_https, verify_ssl)
-    if not ok_tcp or not tcp then
-        Log.debug("[KooboneDownload] socket.tcp 不可用，跳过 Keep-Alive")
-        return nil
-    end
-    if is_https and (not ok_ssl or not ssl) then
-        Log.debug("[KooboneDownload] ssl 模块不可用，跳过 Keep-Alive")
-        return nil
-    end
-
-    local scheme, host_port = url:match("^(https?)://([^/]+)")
-    if not host_port then return nil end
-    local host, port_str = host_port:match("^([^:]+):?(%d*)$")
-    local port = tonumber(port_str) or (is_https and 443 or 80)
-
-    local raw_sock = nil
-    local wrapped_sock = nil
-
-    local function connect()
-        raw_sock = assert(tcp())
-        raw_sock:settimeout(30)
-        local ok, err = raw_sock:connect(host, port)
-        if not ok then
-            return nil, "TCP连接失败: " .. tostring(err)
-        end
-        if is_https then
-            local ssl_ok, ssl_err = pcall(function()
-                wrapped_sock = ssl.wrap(raw_sock, {
-                    mode = "client",
-                    protocol = "tlsv1_2",
-                    verify = verify_ssl and "peer" or "none",
-                    options = "all",
-                })
-                assert(wrapped_sock:dohandshake())
-            end)
-            if not ssl_ok then
-                raw_sock:close()
-                raw_sock = nil
-                return nil, "SSL握手失败: " .. tostring(ssl_err)
-            end
-        else
-            wrapped_sock = raw_sock
-        end
-        return wrapped_sock
-    end
-
-    local function get()
-        if wrapped_sock then
-            return wrapped_sock
-        end
-        return connect()
-    end
-
-    local function close()
-        if wrapped_sock then
-            pcall(function() wrapped_sock:close() end)
-            wrapped_sock = nil
-        end
-        if raw_sock then
-            pcall(function() raw_sock:close() end)
-            raw_sock = nil
-        end
-    end
-
-    return { get = get, close = close, host = host, port = port, is_https = is_https }
-end
-
--- ============================================================
--- 从 GET 响应头提取 Content-Length（替代独立 HEAD 请求）
--- ============================================================
-
-local function extract_content_length(headers)
-    if not headers then return nil end
-    for k, v in pairs(headers) do
-        if tostring(k):lower() == "content-length" then
-            local size = tonumber(v)
-            if size and size > 0 then
-                return size
-            end
-        end
-    end
-    return nil
-end
 
 -- ============================================================
 -- 核心下载函数
 -- ============================================================
 
-function M.do_http_download(url, save_tmp_path, expected_size, verify_ssl, cookie)
-    local transport, is_https, err = pick_transport(url)
-    if not transport then
-        return nil, err
-    end
-
-    local default_headers = build_headers(url, cookie)
-    local out_file = io.open(save_tmp_path, "wb")
-    if not out_file then
-        return nil, "无法打开临时文件写入: " .. save_tmp_path
-    end
-
-    local downloaded = 0
-    local last_progress_bytes = 0
-    local last_progress_percent = -1
-    local progress_chunk = 256 * 1024
-    local expected = tonumber(expected_size) or 0
-    local last_ui_update = 0
-
-    local sink_writer = function(chunk, sink_err)
-        if chunk == nil then
-            return nil, sink_err
-        end
-        if chunk ~= "" then
-            out_file:write(chunk)
-            downloaded = downloaded + #chunk
-            local now = M.now_ms()
-            local should_update = false
-            if downloaded - last_progress_bytes >= progress_chunk then
-                should_update = true
-            end
-            if expected > 0 then
-                local pct = math.floor((downloaded / expected) * 100)
-                if pct - last_progress_percent >= 2 then
-                    should_update = true
-                    last_progress_percent = pct
-                end
-            end
-            if should_update and (now - last_ui_update) >= 100 then
-                last_ui_update = now
-                last_progress_bytes = downloaded
-                _state.updateDownloadProgress(downloaded, expected, string.format("下载中 %s/%s",
-                    M.format_size(downloaded), M.format_size(expected)))
-            end
-        end
-        return chunk
-    end
-
-    local custom_sink = setmetatable({}, {
-        __call = function(_, chunk, sink_err)
-            return sink_writer(chunk, sink_err)
-        end
-    })
-
-    local request_options = {
-        url = url,
-        sink = custom_sink,
-        timeout = 180,
-        headers = default_headers,
-    }
-    apply_ssl_opts(request_options, is_https, verify_ssl)
-
-    local t0 = M.now_ms()
-    local ok_trans, result1, result2, result3 = pcall(transport.request, request_options)
-    out_file:close()
-    local elapsed = M.now_ms() - t0
-
-    if not ok_trans then
-        return nil, "HTTP连接异常: " .. tostring(result1)
-    end
-
-    local code = result2
-    if type(code) ~= "number" or code < 200 or code >= 300 then
-        return nil, "HTTP " .. tostring(code) .. " (elapsed=" .. math.floor(elapsed) .. "ms)"
-    end
-
-    return downloaded, nil
-end
 
 function M.do_http_download_with_progress(url, save_tmp_path, expected_size, verify_ssl, cookie, progress_callback, cancel_check)
     local transport, is_https, err = pick_transport(url)
@@ -349,7 +220,9 @@ function M.do_http_download_with_progress(url, save_tmp_path, expected_size, ver
     local exist_size = 0
     local resume_supported = false
     local file_mode = "wb"
-    local existing_attr = lfs.attributes(save_tmp_path, "size")
+    -- lfs.attributes(path, "size") 直接返回字节数（number），不是 attribute 表。
+    -- ok_lfs 兜底：lfs 不可用时 exist_size 保持 0 → 退化为整文件重下，不会报错。
+    local existing_attr = ok_lfs and lfs and lfs.attributes(save_tmp_path, "size") or nil
     if existing_attr and existing_attr > 0 then
         exist_size = existing_attr
         if expected > 0 and exist_size >= expected then
@@ -383,7 +256,19 @@ function M.do_http_download_with_progress(url, save_tmp_path, expected_size, ver
     local progress_chunk = 1024 * 1024
     local last_ui_update = 0
     local cancelled = false
-    local remote_content_length = nil
+    local sink_err_msg = nil
+    local last_rate_ms = M.now_ms()
+    local last_rate_bytes = exist_size
+
+    -- 记住第一个真实失败原因（写失败 / 停滞），供请求返回后精确上报。
+    -- 注意不用于「取消」：取消有自己的出口（见函数末尾的 cancelled 分支）。
+    local function fail_sink(msg)
+        if not sink_err_msg then
+            sink_err_msg = msg
+            Log.error("[KooboneDownload] " .. msg .. " path=" .. tostring(save_tmp_path))
+        end
+        return nil, sink_err_msg
+    end
 
     local sink_writer = function(chunk, sink_err)
         if chunk == nil then
@@ -391,21 +276,34 @@ function M.do_http_download_with_progress(url, save_tmp_path, expected_size, ver
         end
         if cancel_check and cancel_check() then
             cancelled = true
-            out_file:close()
+            close_quietly(out_file)
             return nil, "cancelled"
         end
+        if sink_err_msg then
+            return nil, sink_err_msg
+        end
         if chunk ~= "" then
-            out_file:write(chunk)
+            -- ⚠️ write 的返回值必须检查（同 do_http_download）：磁盘写满 / 配额耗尽时
+            -- write 返回 nil, err，不检查的话落盘一个截断的 EPUB 却报「下载成功」。
+            local write_ok, write_err = out_file:write(chunk)
+            if not write_ok then
+                return fail_sink("写入文件失败: " .. tostring(write_err))
+            end
             downloaded = downloaded + #chunk
             local now = M.now_ms()
+            -- 速率检测（见文件顶部 STALL_MS / MIN_RATE 说明）
+            local dt = now - last_rate_ms
+            if dt >= STALL_MS then
+                local rate = (downloaded - last_rate_bytes) * 1000 / dt
+                if rate < MIN_RATE then
+                    return fail_sink(string.format("下载停滞（%.0f B/s < %d B/s，已持续 %.0fs）",
+                        rate, MIN_RATE, dt / 1000))
+                end
+                last_rate_ms = now
+                last_rate_bytes = downloaded
+            end
             local should_update = false
             if downloaded - last_progress_bytes >= progress_chunk then
-                should_update = true
-            end
-            -- 从响应头自动检测 Content-Length（如果之前不知道 expected）
-            if expected <= 0 and remote_content_length and remote_content_length > 0 then
-                expected = remote_content_length
-                Log.info("[KooboneDownload] 从响应头检测到 Content-Length: " .. expected)
                 should_update = true
             end
             if expected > 0 then
@@ -434,9 +332,6 @@ function M.do_http_download_with_progress(url, save_tmp_path, expected_size, ver
         end
     })
 
-    -- 使用 response_headers 捕获表来读取 Content-Length
-    local response_headers = {}
-
     local request_options = {
         url = url,
         sink = custom_sink,
@@ -451,18 +346,9 @@ function M.do_http_download_with_progress(url, save_tmp_path, expected_size, ver
     end
 
     local t0 = M.now_ms()
-    local ok_trans, result1, result2, result3 = pcall(transport.request, request_options)
-    out_file:close()
+    local ok_trans, result1, result2 = pcall(transport.request, request_options)
+    close_quietly(out_file)
     local elapsed = M.now_ms() - t0
-
-    -- 优化: 从 GET 响应头提取 Content-Length（替代独立的 HEAD 请求）
-    if ok_trans and result3 and type(result3) == "table" then
-        local cl = extract_content_length(result3)
-        if cl then
-            remote_content_length = cl
-            Log.info("[KooboneDownload] 从 GET 响应头获取 Content-Length: " .. cl)
-        end
-    end
 
     if gc_was_running then
         collectgarbage("restart")
@@ -477,6 +363,14 @@ function M.do_http_download_with_progress(url, save_tmp_path, expected_size, ver
     if not ok_trans then
         Log.warn("[KooboneDownload] HTTP异常，保留断点文件: " .. save_tmp_path .. " err=" .. tostring(result1))
         return nil, "HTTP连接异常: " .. tostring(result1)
+    end
+
+    -- sink 侧的真实失败原因（写失败 / 停滞）优先于 HTTP 状态码上报：
+    -- sink 返回 nil 时 transport 只会给一个含糊的返回值，落到下面会被当成 "HTTP nil"。
+    if sink_err_msg then
+        Log.warn("[KooboneDownload] " .. sink_err_msg
+            .. " 保留断点文件: " .. save_tmp_path .. " size=" .. downloaded)
+        return nil, sink_err_msg
     end
 
     local code = result2
@@ -500,78 +394,5 @@ function M.do_http_download_with_progress(url, save_tmp_path, expected_size, ver
     return downloaded, nil
 end
 
-function M.get_remote_file_size(url, cookie)
-    local transport, is_https, err = pick_transport(url)
-    if not transport then
-        return nil
-    end
-
-    -- 区分 dl.php 和其他域名，build_headers 一致的策略
-    local url_str = tostring(url or "")
-    local url_lower = url_str:lower()
-    local is_dl_server = url_lower:find("dl%.php") ~= nil or url_lower:find("/dl/") ~= nil or url_lower:find("dl%d*%.koobone%.com") ~= nil
-
-    Log.debug("[KooboneDownload] get_remote_file_size url=" .. url_str:sub(1, 120) .. " is_dl_server=" .. tostring(is_dl_server))
-
-    local head_headers = {
-        ["User-Agent"] = DESKTOP_UA,
-        ["Accept"] = "*/*",
-        ["Accept-Language"] = "zh-CN,zh;q=0.9",
-        ["Accept-Encoding"] = "identity",
-        ["Cache-Control"] = "max-age=0",
-        ["Connection"] = "keep-alive",
-    }
-    if is_dl_server then
-        -- dl.php HEAD 请求也带 Origin+Referer，和 GET 一致
-        head_headers["Referer"] = "https://koobone.com/"
-        head_headers["Origin"] = "https://koobone.com"
-        head_headers["Sec-Fetch-Dest"] = "empty"
-        head_headers["Sec-Fetch-Mode"] = "cors"
-        head_headers["Sec-Fetch-Site"] = "same-site"
-        head_headers["x-kb-from"] = "KOOBONE/5.0.0 WEB(7) FETCH /"
-    end
-    if cookie and cookie ~= "" then
-        head_headers["Cookie"] = cookie
-    end
-
-    local request_options = {
-        method = "HEAD",
-        url = url,
-        sink = ltn12.sink.null(),
-        headers = head_headers,
-        timeout = 30,
-    }
-    apply_ssl_opts(request_options, is_https, true)
-
-    local ok, result1, result2, result3 = pcall(transport.request, request_options)
-    if not ok then
-        Log.warn("[KooboneDownload] HEAD request failed: " .. tostring(result1))
-        return nil
-    end
-
-    local code = result2
-    if type(code) ~= "number" or code < 200 or code >= 300 then
-        Log.warn("[KooboneDownload] HEAD request returned HTTP " .. tostring(code))
-        return nil
-    end
-
-    local resp_headers = result3 or {}
-    local content_length = nil
-    for k, v in pairs(resp_headers or {}) do
-        if tostring(k):lower() == "content-length" then
-            content_length = v
-            break
-        end
-    end
-    if content_length then
-        local size = tonumber(content_length)
-        if size and size > 0 then
-            Log.info("[KooboneDownload] HEAD got Content-Length: " .. size)
-            return size
-        end
-    end
-
-    return nil
-end
 
 return M

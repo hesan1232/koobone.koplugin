@@ -7,40 +7,30 @@ function M.create()
         _download_queue = {},
         _active_downloads = {},
         _queue_processing = false,
-        _queue_listeners = {},
+        _queue_processing_at = 0,
     }
 end
 
-function M.get_status(state)
-    local queued = #state._download_queue
-    local active_count = 0
-    for _ in pairs(state._active_downloads) do
-        active_count = active_count + 1
+-- 「队列正在处理」的判据。
+--
+-- 【为什么不能只看布尔】Async 被取消时 on_done 不会执行（见 koobone/async.lua 的 poll
+-- 守卫 `if handle._cancelled then return end`），纯布尔标志一旦没被复位就会永久卡在 true ——
+-- 后果是所有 enqueue 都被 `if not state._queue_processing then M._process(...) end`
+-- 静默跳过（表现：点「下载」毫无反应，只能重启 KOReader）。
+-- _process 里已用 opts.on_cancel 补做清理（第一道防线），这里是第二道：
+-- 时间戳超时未刷新即视为僵死，强制接管。
+local QUEUE_STALE_SECONDS = 15 * 60   -- 单个条目的 async timeout 是 600s，留 1.5 倍余量
+local function is_processing(state)
+    if not state._queue_processing then return false end
+    local started_at = state._queue_processing_at or 0
+    if started_at > 0 and (os.time() - started_at) < QUEUE_STALE_SECONDS then
+        return true
     end
-    return {
-        queued = queued,
-        active = active_count,
-        total = queued + active_count,
-        processing = state._queue_processing,
-    }
-end
-
-function M.subscribe(state, listener_id, callback)
-    state._queue_listeners[listener_id] = callback
-end
-
-function M.unsubscribe(state, listener_id)
-    state._queue_listeners[listener_id] = nil
-end
-
-function M._notify(state)
-    local status = M.get_status(state)
-    for id, cb in pairs(state._queue_listeners) do
-        local ok, err = pcall(cb, status)
-        if not ok then
-            Log.warn("[KooboneQueue] 通知失败 listener=" .. tostring(id) .. " err=" .. tostring(err))
-        end
-    end
+    Log.warn("[KooboneQueue] _queue_processing 已僵死超过 " .. QUEUE_STALE_SECONDS
+        .. "s（疑似取消路径未复位），强制接管")
+    state._queue_processing = false
+    state._queue_processing_at = 0
+    return false
 end
 
 function M.enqueue(state, vol, opts, callbacks)
@@ -79,9 +69,7 @@ function M.enqueue(state, vol, opts, callbacks)
     table.insert(state._download_queue, item)
     Log.info("[KooboneQueue] 已加入下载队列: " .. vol_title .. " fmd=" .. fmd .. " 队列位置=" .. #state._download_queue)
 
-    M._notify(state)
-
-    if not state._queue_processing then
+    if not is_processing(state) then
         M._process(state, callbacks)
     end
 
@@ -112,16 +100,19 @@ function M.enqueue_batch(state, vols, opts, callbacks)
 end
 
 function M._process(state, callbacks)
-    if state._queue_processing then return end
+    if is_processing(state) then return end
     if #state._download_queue == 0 then return end
 
     state._queue_processing = true
-    M._notify(state)
+    state._queue_processing_at = os.time()
 
     local function process_next()
+        -- 每处理一项都刷新时间戳：僵死窗口只需覆盖「单个条目的下载时长」（async
+        -- timeout 600s），而不是整个队列（长队列可能几十分钟），否则会被误判为僵死。
+        state._queue_processing_at = os.time()
         if #state._download_queue == 0 then
             state._queue_processing = false
-            M._notify(state)
+            state._queue_processing_at = 0
             Log.info("[KooboneQueue] 下载队列已清空")
             return
         end
@@ -129,7 +120,7 @@ function M._process(state, callbacks)
         local item = table.remove(state._download_queue, 1)
         if not item then
             state._queue_processing = false
-            M._notify(state)
+            state._queue_processing_at = 0
             return
         end
 
@@ -150,7 +141,6 @@ function M._process(state, callbacks)
             started_at = os.time(),
             source = "queue",
         }
-        M._notify(state)
 
         Log.info("[KooboneQueue] 队列开始下载: " .. vol_title .. " fmd=" .. fmd)
 
@@ -160,7 +150,6 @@ function M._process(state, callbacks)
         if not download_fn or not async_run then
             Log.warn("[KooboneQueue] 缺少下载回调，无法处理队列项: " .. vol_title)
             state._active_downloads[fmd] = nil
-            M._notify(state)
             process_next()
             return
         end
@@ -190,10 +179,20 @@ function M._process(state, callbacks)
                     end
                 end
 
-                M._notify(state)
                 process_next()
             end,
-            { timeout = 600 }
+            {
+                timeout = 600,
+                -- 【取消路径必须自己收尾】Async 被取消时 on_done 不会执行，而
+                -- _active_downloads / _queue_processing 的清理全写在 on_done 里。
+                -- 主插件退出时会 Async.cancel_all()，不补这一句就会留下
+                -- _queue_processing == true 的僵死状态（后续 enqueue 全被静默跳过）。
+                on_cancel = function()
+                    state._active_downloads[fmd] = nil
+                    state._queue_processing = false
+                    state._queue_processing_at = 0
+                end,
+            }
         )
     end
 
@@ -206,19 +205,10 @@ function M.remove_from_queue(state, fmd)
         if tostring(item.vol.file_md5 or item.vol.fmd) == fmd then
             table.remove(state._download_queue, i)
             Log.info("[KooboneQueue] 已从队列移除: " .. tostring(item.title))
-            M._notify(state)
             return true
         end
     end
     return false
-end
-
-function M.clear_queue(state)
-    local count = #state._download_queue
-    state._download_queue = {}
-    Log.info("[KooboneQueue] 已清空下载队列: " .. count .. " 项")
-    M._notify(state)
-    return count
 end
 
 function M.is_downloading(state, fmd)
@@ -227,17 +217,15 @@ function M.is_downloading(state, fmd)
 end
 
 -- 是否在 pending 队列里（尚未开始下载，正在排队）
+-- 注意：队列数组的字段名是 `_download_queue`。此前这里错读成 `state.pending`，
+-- 该字段从未定义 → 恒返回 false，导致 main.lua 预下载的去重检查形同虚设。
 function M.is_enqueued(state, fmd)
-    if not fmd or not state.pending or #state.pending == 0 then return false end
-    for _, item in ipairs(state.pending) do
+    if not fmd or not state._download_queue or #state._download_queue == 0 then return false end
+    for _, item in ipairs(state._download_queue) do
         local f = tostring(item.vol and (item.vol.file_md5 or item.vol.fmd) or "")
         if f == fmd then return true end
     end
     return false
-end
-
-function M.get_active_downloads(state)
-    return state._active_downloads
 end
 
 return M

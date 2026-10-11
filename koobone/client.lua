@@ -4,7 +4,7 @@ local Log = require("koobone.logger")
 local Koobone = require("koobone.koobone")
 
 local ok_info, Info = pcall(require, "koobone.info")
-local CLIENT_VERSION = ok_info and Info and Info.version or "0.2.0"
+local CLIENT_VERSION = ok_info and Info and Info.version or "1.4.0"
 
 local ok_https, https = pcall(require, "ssl.https")
 local ok_http, http = pcall(require, "socket.http")
@@ -23,7 +23,7 @@ if not ok_json then
 end
 
 local DEFAULT_TIMEOUT = 15
-local DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+local DESKTOP_UA = H.DESKTOP_UA
 local SHELF_CACHE_TTL = 300  -- 5分钟（与 fanqie 一致，避免重复发起网络请求）
 
 local Client = {}
@@ -39,29 +39,6 @@ local VOL_LIST_CACHE_GLOBAL = {
 -- key = series_id, value = { ts, data }
 local VOL_LIST_CACHE_BY_SERIES = {}
 
-local function header_value(headers, name)
-    if not headers then
-        return nil
-    end
-    local target = name:lower()
-    if type(headers) == "table" then
-        for key, value in pairs(headers) do
-            if tostring(key):lower() == target then
-                return value
-            end
-        end
-        if #headers > 0 and type(headers[1]) == "table" then
-            for _, tuple in ipairs(headers) do
-                if type(tuple) == "table" and #tuple >= 2 then
-                    if tostring(tuple[1]):lower() == target then
-                        return tuple[2]
-                    end
-                end
-            end
-        end
-    end
-    return nil
-end
 
 local function transport_request(transport, request, timeout)
     timeout = timeout or DEFAULT_TIMEOUT
@@ -92,6 +69,85 @@ local function transport_request(transport, request, timeout)
         error("HTTP连接失败: transport_request连接失败: " .. result2)
     end
     return result1, result2, result3, result4
+end
+
+-- ============================================================
+-- 网络错误分级重试
+--
+-- 移植自 reading.koplugin/reading/webdav.lua 的 RETRY_CONFIG / is_retryable_code /
+-- get_retry_delay 三件套。
+--
+-- 此前 koobone 的 **API 层（本文件）完全没有重试**：一次瞬时连接失败/瞬时 5xx 就会
+-- 把异常直接抛给调用方，而 bookshelf:refresh 的整条链是「一次失败即中止」——
+-- 于是弱网下打开书架＝「书架为空/拉取失败」，缓存的旧数据白留着没用上。
+-- （唯一的重试逻辑在 **EPUB 下载路径**：download.lua 的「策略链 + 同策略 3 次重试」；
+--   那一层走 http_downloader 直连 transport，不经过本文件，两者互不影响、不会叠加。）
+--
+-- ⚠️ 调用点全部位于 Async.run 子进程内（bookshelf:refresh / progress:query_vol_info /
+--    shelf_view 的单张封面下载），因此下面的 socket.sleep 不会阻塞 UI 线程。
+-- ============================================================
+local RETRY_CONFIG = {
+    max_retries   = 2,   -- 最大重试次数（总请求次数 = 1 + max_retries = 3）
+    initial_delay = 1,   -- 首次重试前的等待秒数
+    max_delay     = 4,   -- 退避延迟上限
+}
+
+-- 判断响应码是否为可重试的瞬时错误。
+--   · code == nil        → 请求抛异常 / 连接被重置，瞬时错误，重试；
+--   · 5xx / 408 / 429    → 服务端瞬时故障或限流，重试；
+--   · 其余 4xx（401/403/404…）与业务错误 → 确定性错误，重试无意义，**立即停**。
+local function is_retryable_code(code)
+    if code == nil then return true end
+    if type(code) ~= "number" then return false end
+    return (code >= 500 and code <= 599) or code == 408 or code == 429
+end
+
+-- 指数退避：第 attempt 次失败后的等待秒数（1s, 2s, 4s...，受 max_delay 封顶）
+local function get_retry_delay(attempt)
+    local delay = RETRY_CONFIG.initial_delay * (2 ^ (attempt - 1))
+    if delay > RETRY_CONFIG.max_delay then
+        delay = RETRY_CONFIG.max_delay
+    end
+    return delay
+end
+
+-- 带重试的请求执行器。
+-- attempt_fn: 闭包，**每次调用都必须重新构建 sink 等状态**并执行 transport_request
+--             （沿用上一次的 sink 会把两次响应体拼在一起 → JSON 解析必然失败）；
+--             抛异常视为可重试的瞬时错误。
+-- description: 日志用描述（如 "GET https://…/series_list.php"）。
+-- 返回: 与 attempt_fn 相同的多返回值；重试耗尽后若最后一次是异常，则原样重新抛出，
+--       保持调用方此前依赖的「连接失败会 error」行为不变。
+local function request_with_retry(description, attempt_fn)
+    local attempt = 0
+    while true do
+        attempt = attempt + 1
+        local ok, r1, r2, r3, r4 = pcall(attempt_fn)
+
+        -- 异常一律视为瞬时错误；正常返回时按响应码分级
+        local retryable = (not ok) or is_retryable_code(r2)
+
+        if not retryable then
+            return r1, r2, r3, r4
+        end
+
+        if attempt > RETRY_CONFIG.max_retries then
+            if not ok then
+                -- 保持原行为：连接失败原样抛出（level 0 → 不带本文件位置前缀）
+                error(r1, 0)
+            end
+            Log.warn(string.format("[Koobone] 请求[%s] 重试 %d 次后仍失败: code=%s",
+                description, RETRY_CONFIG.max_retries, tostring(r2)))
+            return r1, r2, r3, r4
+        end
+
+        local delay = get_retry_delay(attempt)
+        Log.warn(string.format("[Koobone] 请求[%s] 第 %d 次失败(%s)，%.1fs 后重试",
+            description, attempt, ok and tostring(r2) or tostring(r1), delay))
+        if ok_socket_perf and socket_perf and socket_perf.sleep then
+            socket_perf.sleep(delay)
+        end
+    end
 end
 
 function Client:new(settings, auth)
@@ -217,14 +273,22 @@ function Client:request(opts)
         error("HTTP连接失败: socket.http is not available")
     end
 
+    -- 每次尝试都重建 response/sink：失败尝试的响应体（如 5xx 错误页）已被写进 sink，
+    -- 沿用同一个表会把两次响应拼在一起 → 后续 JSON 解析必然失败。
     local response = {}
-    local _, code, resp_headers, status = transport_request(transport, {
-        url = full_url,
-        method = method,
-        headers = headers,
-        source = body and ltn12.source.string(body) or nil,
-        sink = ltn12.sink.table(response),
-    }, timeout)
+    local function do_request()
+        response = {}
+        return transport_request(transport, {
+            url = full_url,
+            method = method,
+            headers = headers,
+            source = body and ltn12.source.string(body) or nil,
+            sink = ltn12.sink.table(response),
+        }, timeout)
+    end
+    -- 分级重试：瞬时错误（连接失败 / 5xx / 408 / 429）自动退避重试，4xx 立即返回
+    local _, code, resp_headers, status = request_with_retry(
+        method .. " " .. full_url, do_request)
 
     local body_text = table.concat(response)
     if not code or (type(code) == "number" and code >= 400) then
@@ -281,21 +345,27 @@ function Client:get_binary(url, opts)
     end
 
     local response = {}
-    local request_options = {
-        url = url,
-        method = "GET",
-        headers = headers,
-        sink = ltn12.sink.table(response),
-    }
-    -- SSL bypass（和 EPUB/HttpDL 一致：Kindle 旧 CA 无法验证 img.koobone.com 证书）
-    if scheme_match == "https" then
-        request_options.mode = "client"
-        request_options.protocol = "tlsv1_2"
-        request_options.verify = "none"
-        request_options.options = "all"
+    -- 每次尝试都重建 sink（失败尝试的响应体已写入 response，沿用会把两次响应拼接）
+    local function do_request()
+        response = {}
+        local request_options = {
+            url = url,
+            method = "GET",
+            headers = headers,
+            sink = ltn12.sink.table(response),
+        }
+        -- SSL bypass（和 EPUB/HttpDL 一致：Kindle 旧 CA 无法验证 img.koobone.com 证书）
+        if scheme_match == "https" then
+            request_options.mode = "client"
+            request_options.protocol = "tlsv1_2"
+            request_options.verify = "none"
+            request_options.options = "all"
+        end
+        return transport_request(transport, request_options, timeout)
     end
 
-    local _, code, _ = transport_request(transport, request_options, timeout)
+    -- 分级重试（同 Client:request）：封面是 CDN 图片，限流/瞬时 5xx 很常见
+    local _, code = request_with_retry("get_binary " .. url, do_request)
     local data = table.concat(response)
     if type(code) ~= "number" or code < 200 or code >= 300 then
         error(string.format("get_binary: HTTP %s url=%s", tostring(code), tostring(url)))
@@ -326,10 +396,6 @@ function Client:is_auth_error(code, body_text)
     return false
 end
 
-function Client:get_user_info()
-    -- api_key 直传鉴权：服务端从 X-KB-INFO 头推导用户身份，无需客户端传 uin
-    return { uin = "" }, ""
-end
 
 local function normalize_vol_item(item)
     if not item or type(item) ~= "table" then
@@ -650,8 +716,12 @@ function Client:report_read_page(fmd, page, total_or_nil)
 
     Log.debug("[Koobone] report_read_page: fmd=" .. fmd .. ", page=" .. tostring(page))
 
-    local text, code, headers, status
-    local ok, err = pcall(function()
+    -- ⚠️ pcall 的第一个返回值是「成功标志」，其后才是被包函数的返回值。
+    -- 本函数在 return_header=true 时，Client:request 返回 (text, code, headers, status)，
+    -- 必须逐个接住。旧写法 `local ok, err = pcall(...)` 只接住前两个：`err` 其实是响应体
+    -- text，code/headers/status 全为 nil → 下面 `not code` 恒真 → 每次都被迫降级到
+    -- act=uptime（而 uptime 不携带页码 par2）→ 带页码的 act=readpage 从未真正走通。
+    local ok, text, code = pcall(function()
         return self:request({
             method = "GET",
             path = "/vol_act.php",
@@ -665,18 +735,18 @@ function Client:report_read_page(fmd, page, total_or_nil)
     end)
 
     local resp_obj = nil
-    if ok then
-        text, code, headers, status = text, code, headers, status
-        if text and text ~= "" then
-            pcall(function()
-                resp_obj = self:json_decode(text)
-            end)
-        end
+    if ok and text and text ~= "" then
+        pcall(function()
+            resp_obj = self:json_decode(text)
+        end)
     end
 
     if not ok or not code or (type(code) == "number" and code >= 400) then
-        Log.warn("[Koobone] report_read_page act=readpage 失败 (code=" .. tostring(code or "nil")
-        .. ", fallback 到 act=uptime...")
+        -- pcall 失败时，text 位置收到的是错误消息（request 抛异常）
+        Log.warn("[Koobone] report_read_page act=readpage 失败 (ok=" .. tostring(ok)
+        .. ", code=" .. tostring(code or "nil")
+        .. (not ok and (", err=" .. tostring(text)) or "")
+        .. "), fallback 到 act=uptime...")
         local fb_ok, fb_msg, fb_resp = self:report_uptime(fmd)
         return fb_ok, fb_msg, fb_resp, true
     end
@@ -691,6 +761,27 @@ function Client:report_read_page(fmd, page, total_or_nil)
     end
 
     return success, message, resp_obj, false
+end
+
+--- 上传阅读进度到云端。
+-- shelf_view 的"手动上传云端进度"此前调用了一个并不存在的方法 `client:upload_progress`，
+-- 被 pcall/Async 吞掉后永远显示"上传失败"。这里补上，统一复用 report_read_page 链路
+-- （含 act=uptime 兜底），并把返回值规整成 (ok, msg)。
+-- @return boolean ok
+-- @return string  成功/失败信息
+function Client:upload_progress(fmd, page, total_or_nil)
+    if not fmd or fmd == "" then
+        return false, "fmd 为空"
+    end
+
+    local called_ok, success, message = pcall(function()
+        return self:report_read_page(fmd, tonumber(page) or 0, tonumber(total_or_nil) or nil)
+    end)
+
+    if not called_ok then
+        return false, tostring(success or "upload exception")
+    end
+    return success == true, tostring(message or "")
 end
 
 function Client:report_uptime(fmd)

@@ -41,8 +41,6 @@ if not Menu then return end
 local InputDialog = safe_require("ui/widget/inputdialog", true)
 if not InputDialog then return end
 
-local TextViewer = safe_require("ui/widget/textviewer")
-
 local Event = safe_require("ui/event")
 
 local GestureRange = safe_require("ui/gesturerange")
@@ -93,15 +91,10 @@ if not ShelfView then return end
 local Download = safe_require("koobone.download", true)
 if not Download then return end
 
-local DownloadProgress = safe_require("koobone.download_progress", true)
-if not DownloadProgress then return end
-
 local Reader = safe_require("koobone.reader", true)
 if not Reader then return end
 
 local Info = safe_require("koobone.info", true)
-
-local I18n = safe_require("koobone.i18n", true)
 
 local Koobone = safe_require("koobone.koobone", true)
 
@@ -109,6 +102,10 @@ local Patches = safe_require("patches.core", true)
 
 local Progress = safe_require("koobone.progress", true)
 if not Progress then return end
+
+-- 自更新：updater_ui 负责菜单与流程编排，updater / digests / updater_http 由它按需 require。
+-- 非必需模块 —— 加载失败只是「检查更新」不可用，插件本体照常工作。
+local UpdaterUI = safe_require("koobone.updater_ui")
 
 local unpack_args = unpack or table.unpack
 
@@ -155,8 +152,78 @@ local KoobonePlugin = WidgetContainer:extend{
     name = "koobone",
     is_doc_only = false,
     fullname = Info and Info.fullname or _("Koobone 漫画"),
-    version = Info and Info.version or "1.2.0",
+    version = Info and Info.version or "1.4.0",
 }
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- 「首页被别的控件遮住时，依然能收到 Dispatcher 派发的动作事件」
+-- ════════════════════════════════════════════════════════════════════════════
+--
+-- 【问题】UIManager:sendEvent（frontend/ui/uimanager.lua:884）先把事件送给窗口栈最上面
+-- 那个非 toast 控件；它不消费时，才继续送给「该控件的 active_widgets」以及
+-- 「is_always_active 的控件」。而 FileManager / ReaderUI 自身都不是 is_always_active
+-- （全仓库只有前光 / 自然光 / 输入框 / 键盘等 6 处是），所以：
+--
+--   **只要有控件盖在首页之上**（例如第三方桌面类插件），Dispatcher 派发到本插件的
+--   动作就永远送不到它。
+--
+-- 现象恰好是「菜单能打开书架、手势点了没反应」—— 菜单项是回调直接调方法，不走事件派发；
+-- 手势要走 Dispatcher:execute → UIManager:sendEvent。（2026-10-11 在设备上实测确认：
+-- 把覆盖首页的那个插件关掉，手势立刻恢复。）
+--
+-- 【上游留的口子】FileManager/ReaderUI:registerModule(name, module, always_active)
+-- 第三个参数为 true 时会把 module 插进 self.active_widgets，注释写着
+-- "to get events even when hidden"。但插件实例是由 PluginLoader 创建后交给
+-- registerModule 的，第三个参数没传（= false）→ 插件默认收不到被遮挡时的事件。
+-- 这里把自己补进去。（不能反过来去调 registerModule：它内部还会
+-- table.insert(self, module)，会让插件在 FileManager 的数组部分出现两次，
+-- propagateEvent 就会把它调两遍。）
+--
+-- 【为什么用一个「只放行自有事件」的桥，而不是把插件本身插进去】
+--   ① 插件已经在 FileManager/ReaderUI 的**数组部分**（registerModule 里的
+--      table.insert(self, ui_module)）。sendEvent 在「top_widget 自己」这条路径上
+--      会经 WidgetContainer:propagateEvent 把事件送到插件一次；若插件同时也在
+--      active_widgets 里，同一次 sendEvent 会在「top_widget 没消费」之后**再送一次**
+--      （uimanager.lua:906-918）。桥只放行下面这几个自有事件，而这些事件的处理函数
+--      都返回 true（= 已消费）→ 第一条路径就截断了，第二条根本轮不到桥，不会重复触发。
+--   ② 桥把「因被遮挡而新增的接收面」严格限制在自有事件上 —— 插件永远不会因为被遮挡
+--      而多收到 Touch / Gesture / KeyPress 等输入事件，行为零回归。
+--
+-- 幂等；ui 结构不符合预期时安全退出（退化为原有行为）。
+--
+-- 放行表用 Event.handler 名（frontend/ui/event.lua:31 是 `handler = "on"..name`）。
+local DISPATCH_HANDLERS = {
+    onShowKooboneBookshelf = true,
+}
+
+local function ensure_dispatch_reachable(plugin)
+    local ui = plugin and plugin.ui
+    if not ui or type(ui.active_widgets) ~= "table" then
+        return false
+    end
+    local bridge = plugin._dispatch_bridge
+    if not bridge then
+        -- 桥只认「我们自己的事件」，其余一律返回 nil（不消费、不干扰上游传播）。
+        bridge = {
+            handleEvent = function(_, event)
+                local handler = event and event.handler
+                if not handler or not DISPATCH_HANDLERS[handler] then
+                    return nil
+                end
+                return plugin:handleEvent(event)
+            end,
+        }
+        plugin._dispatch_bridge = bridge
+    end
+    for _, w in ipairs(ui.active_widgets) do
+        if w == bridge then return true end
+    end
+    table.insert(ui.active_widgets, bridge)
+    if Log then
+        pcall(function() Log.info("[Koobone] dispatcher bridge attached to ui.active_widgets") end)
+    end
+    return true
+end
 
 function KoobonePlugin:isCurrentDocKoobone()
     if not (self.ui and self.ui.document) then return false end
@@ -165,7 +232,53 @@ function KoobonePlugin:isCurrentDocKoobone()
     return doc_path:lower():find('/koobone/', 1, true) ~= nil
 end
 
+-- ⚠️ 【为什么拆成 init + _init_modules：一个会「静默弄哑整个插件」的 KOReader 语义】
+--
+-- 上游创建插件实例的链路（已逐行核对）：
+--   frontend/pluginloader.lua:479  PluginLoader:createPluginInstance(plugin, attr)
+--                                  → local ok, re = pcall(plugin.new, plugin, attr)
+--   frontend/ui/widget/widget.lua:40  Widget:new(o)
+--                                  → if o._init then o:_init() end
+--                                    if o.init  then o:init()  end
+-- 合起来就是：**init() 里任何一处抛错，插件实例根本不会被创建**，现场只留下
+--   logger.err("Failed to initialize", "<插件名>", "<错误>")
+-- 一行日志（而且那条错误不会弹给用户）。
+--
+-- 后果对用户是什么样：插件的主菜单没了，它用 Dispatcher:registerAction 注册的手势/按键动作
+-- 也没了；而 Dispatcher:execute 查到一个不存在的动作名时是**静默跳过**的
+-- （frontend/dispatcher.lua:1504 `if Dispatcher:isActionEnabled(settingsList[k])`，
+-- settingsList[k] 为 nil → 条件不成立 → 什么都不做、不报错）。
+-- 于是现象就是「首页手势点了没反应」，而且完全看不出原因 —— 这正是本插件踩过的坑。
+--
+-- 所以把 init 拆开，保证「注册独立于模块构造」：
+--   ① 动作注册最先跑，且不依赖任何模块（自身再包一层 pcall）；
+--   ② 容易抛错的模块构造整段 pcall，失败只降级为「插件不可用」，但插件实例仍存在；
+--   ③ 主菜单注册也单独 pcall。
 function KoobonePlugin:init()
+    pcall(function() self:onDispatcherRegisterActions() end)
+
+    -- 让「首页被别的控件遮住」时也能收到 Dispatcher 派发的动作事件
+    -- （原理见文件上方 ensure_dispatch_reachable 的注释）。
+    -- 放在最前、且自身 pcall：它只做一次 table.insert，永远不会影响插件加载。
+    pcall(function() ensure_dispatch_reachable(self) end)
+
+    local ok_init, err_init = pcall(function() self:_init_modules() end)
+    if not ok_init then
+        self._init_error = tostring(err_init)
+        if Log then
+            pcall(function()
+                Log.error("[Koobone] init 失败，插件降级为不可用：" .. tostring(err_init))
+            end)
+        end
+    end
+
+    if self.ui and self.ui.menu then
+        pcall(function() self.ui.menu:registerToMainMenu(self) end)
+    end
+end
+
+-- 真正做初始化（原 init 主体，逐字保留）。
+function KoobonePlugin:_init_modules()
     -- ============================================================
     -- 关键：KOReader 会给 FileManager 和 ReaderUI 分别 new 一个 Plugin 实例，
     -- 两个 instance 的 self.xxx 互不互通！
@@ -209,6 +322,35 @@ function KoobonePlugin:init()
             patches_ok = self.patches_ok,
         })
         Log.info("[Koobone] init (FIRST/FILEMANAGER): settings/client/auth/bookshelf/download/reader/shelf_view ok -> bindSharedModules")
+
+        -- 启动后延迟清理一次 EPUB 缓存（LRU）。
+        -- 【为什么要延迟】清理要在 UI 线程同步遍历缓存目录、并对每个系列子目录递归
+        -- 统计大小；直接写在 init() 里会拖慢冷启动，而缓存清理一点都不急（下一个
+        -- 未预料的收益：用户不再下载新书时，也能回收「过期未再访问」的老文件 ——
+        -- 光靠「下载成功后触发」是等不到的）。
+        -- 只在首个（FileManager）实例上安排：ReaderUI 实例走的是复用分支。
+        if self.download and self.download.maybe_lru_cleanup then
+            local dl_ref = self.download
+            UIManager:scheduleIn(10, function()
+                pcall(function() dl_ref:maybe_lru_cleanup() end)
+            end)
+        end
+
+        -- 更新自检 + 启动后的自动检查。
+        -- 只放在「首个实例」分支里：KOReader 会给 FileManager 和 ReaderUI 各 new 一个
+        -- Plugin，两边的 init 都会跑 —— 不区分的话每次打开书都会重复触发一遍检查。
+        --
+        -- ⚠️ 必须 pcall：本函数跑在 init 内部，而 init 抛错会让**整个插件不被加载**
+        -- （见文件上方 init 的注释）。更新功能永远不该有「弄哑插件本体」的能力 ——
+        -- 这条在 reading 那边一直是对的，这里是补齐。
+        if UpdaterUI then
+            local ok_up, err_up = pcall(UpdaterUI.startup, self)
+            if not ok_up and Log then
+                pcall(function()
+                    Log.error("[Koobone] updater startup 失败（已忽略）：" .. tostring(err_up))
+                end)
+            end
+        end
     else
         -- ReaderUI 模式（或后续 new 出来的实例）：直接复用 State._shared，不重复 new
         self.settings = shared.settings
@@ -224,15 +366,18 @@ function KoobonePlugin:init()
     -- ShelfView 改为 fanqie 风格的纯函数式模块，不再实例化
     -- 由 KoobonePlugin:showBookList 内部持有返回的 menu 句柄（self.book_list_menu）
     self.book_list_menu = nil
-
-    if self.ui and self.ui.menu then
-        self.ui.menu:registerToMainMenu(self)
-    end
-
-    self:onDispatcherRegisterActions()
 end
 
 function KoobonePlugin:onDispatcherRegisterActions()
+    -- 动作名 / 事件名自 7d3ae0b（首个提交）以来从未变过 ——
+    -- 用户在手势菜单里绑定的就是这个字符串，改名会让所有既有手势绑定失效
+    -- （Dispatcher:execute 查不到动作名只会静默跳过，不报错）。改名属破坏性变更。
+    --
+    -- general = true（而**不是** filemanager = true）：
+    --   · 上游 frontend/dispatcher.lua:889 / 1077 的 section 列表里，general 同时归入
+    --     文件管理器与阅读界面两侧的手势菜单，所以首页手势能选到它；
+    --   · 若再加 filemanager = true，会在手势菜单里**重复出现两项**（每个 section 各列一次），
+    --     所以这里只写 general。
     Dispatcher:registerAction("show_koobone_bookshelf", {
         category = "none",
         event = "ShowKooboneBookshelf",
@@ -241,8 +386,19 @@ function KoobonePlugin:onDispatcherRegisterActions()
     })
 end
 
+-- 手势/按键派发的入口。和 reading 侧一样必须整体兜异常：
+-- 入口抛错会冒泡进 KOReader 事件循环（2026-09-30 在 reading 上实测过：
+-- 绑成手势后一点就让正在读的书一起没了）。showBookshelf 内部虽已自带 xpcall，
+-- 但入口本身仍要兜住「方法不存在 / 调用约定变了」这类更早的失败。
 function KoobonePlugin:onShowKooboneBookshelf()
-    self:showBookshelf()
+    self:safeCallback(_("打开书架"), function()
+        self:showBookshelf()
+    end)()
+    -- 返回 true =「事件已消费」。**必须**返回：插件同时挂在 FileManager 的数组部分与
+    -- active_widgets 上时（见文件上方的 ensure_dispatch_reachable），若这里返回 nil，
+    -- 同一次 sendEvent 会在 FileManager 未消费之后经 active_widgets 再送一次 ——
+    -- 书架会被打开两次。
+    return true
 end
 
 function KoobonePlugin:safeCallback(label, callback)
@@ -314,6 +470,22 @@ function KoobonePlugin:_add_to_menu(menu_table, is_reader)
                     }
                 end
                 return menu_items
+            end,
+        },
+        {
+            text = _("检查更新"),
+            sub_item_table_func = function()
+                if not UpdaterUI then
+                    return { { text = _("更新模块未加载，请查看日志"), enabled = false } }
+                end
+                local ok_menu, items = xpcall(function()
+                    return UpdaterUI.menu_items(self_ref)
+                end, debug.traceback)
+                if not ok_menu or type(items) ~= "table" then
+                    Log.error("updater menu failed: " .. tostring(items))
+                    return { { text = _("更新菜单构建失败，请查看日志"), enabled = false } }
+                end
+                return items
             end,
         },
         {
@@ -401,7 +573,7 @@ function KoobonePlugin:showBookList(series_id_opt)
     end
     end, function(err)
         local msg = "[Koobone] showBookList FAIL:\n" .. tostring(err) .. "\n" .. tostring(debug and debug.traceback and debug.traceback() or "")
-        if Log then pcall(function() Log.err(msg) end) end
+        if Log then pcall(function() Log.error(msg) end) end
         pcall(function() UIManager:show(require("ui/widget/infomessage"):new{ text = msg, timeout = 10 }) end)
         return nil
     end))
@@ -613,24 +785,12 @@ function KoobonePlugin:showBookshelf(series_id_opt, opts)
     -- 已有缓存且已初始化：不再重复后台刷新，用户手动点刷新再更新
     end, function(err)
         local msg = "[Koobone] showBookshelf FAIL:\n" .. tostring(err) .. "\n" .. tostring(debug and debug.traceback and debug.traceback() or "")
-        if Log then pcall(function() Log.err(msg) end) end
+        if Log then pcall(function() Log.error(msg) end) end
         pcall(function() UIManager:show(require("ui/widget/infomessage"):new{ text = msg, timeout = 10 }) end)
         return nil
     end))
 end
 
-function KoobonePlugin:refreshShelf()
-    local self_ref = self
-    if not self.bookshelf then
-        self:showInfo(_("书架模块未加载"))
-        return
-    end
-    local series_id = nil
-    if self.book_list_menu and self.book_list_menu._shelf_view_opts then
-        series_id = self.book_list_menu._shelf_view_opts.series_id
-    end
-    self:showBookshelf(series_id, { force_refresh = true })
-end
 
 function KoobonePlugin:open_comic(vol_or_fmd)
     local vol = vol_or_fmd
@@ -664,6 +824,14 @@ function KoobonePlugin:open_comic(vol_or_fmd)
         return
     end
 
+    -- 换书 = 先给上一本书的会话收尾（**含最后一次上传**），再开新会话。
+    -- ⚠️ 顺序不能反：start_progress_session 会直接替换 self._progress，
+    -- 被替换掉的旧 Progress 就再也没机会上传了 —— 而且 start_progress_session 还会清空
+    -- 会话归属，旧 ReaderUI 的关闭不再触发 close_reader，等于旧进度被静默丢弃。
+    -- 这一条正好补上「①/② 不再误杀会话」之后留下的空档（见 onCloseWidget 的说明）。
+    if self.reader and self.reader._current_vol then
+        pcall(function() self.reader:close_reader(true) end)
+    end
     if self.reader then
         self.reader:start_progress_session(vol)
     end
@@ -802,230 +970,39 @@ function KoobonePlugin:_trigger_preload(current_vol)
     Log.info("[Koobone] 预下载已将 " .. tostring(added) .. " 卷加入队列，跳过 " .. tostring(skipped) .. " 卷")
 end
 
-function KoobonePlugin:download_comic(vol, force)
-    if not vol then return end
-    if not self.download then
-        self:showInfo(_("下载模块未加载"))
-        return
-    end
 
-    local fmd = tostring(vol.file_md5 or vol.fmd or "")
-    if fmd == "" then
-        self:showInfo(_("无效的卷标识"))
-        return
-    end
-
-    -- 如果强制重新下载（从操作菜单的"重新下载"按钮），跳过缓存检查
-    if force then
-        self:_do_download_comic(vol, true)
-        return
-    end
-
-    -- 检查是否已缓存
-    local already_downloaded = false
-    if self.bookshelf then
-        already_downloaded = self.bookshelf:is_vol_downloaded(vol)
-    end
-    if already_downloaded then
-        local self_ref = self
-        UIManager:show(ConfirmBox:new{
-            text = _("该卷已下载，是否重新下载？"),
-            ok_text = _("重新下载"),
-            cancel_text = _("取消"),
-            ok_callback = function()
-                self_ref:_do_download_comic(vol, true)
-            end,
-        })
-        return
-    end
-
-    self:_do_download_comic(vol, false)
-end
-
-function KoobonePlugin:_do_download_comic(vol, force_redownload)
-    -- 子进程不可用时拒绝下载，避免阻塞 UI 线程导致 KOReader 无响应
-    if not Async or not Async.is_available or not Async.is_available() then
-        self:showInfo(_("后台下载不可用，已停止缓存以防 KOReader 无响应"))
-        return
-    end
-    local self_ref = self
-    local fmd = tostring(vol.file_md5 or vol.fmd or "")
-
-    -- api_key 直传鉴权：无需预检查 cookie/sess_key
-    -- 如果强制重新下载，先清除旧缓存
-    if force_redownload and self.download then
-        pcall(function()
-            self_ref.download:delete_vol_cache(vol, fmd, vol.file_md5)
-        end)
-    end
-
-    -- 生成子进程 IPC 文件路径（子进程写进度，父进程读）
-    local ipc_paths = self.download:ipc_paths(fmd)
-    self.download:ipc_cleanup(ipc_paths)  -- 清理上次残留
-
-    -- 创建下载进度对话框
-    local ok_DLProgress, DownloadProgress = pcall(require, "koobone.download_progress")
-    local progress_dialog = nil
-    local download_here = true  -- 标记是否在前台下载（用于"后台运行"切换）
-    local poll_handle = nil     -- 轮询定时器句柄
-    if ok_DLProgress and DownloadProgress then
-        local vol_title = (vol and (vol.title or vol.vol_name)) or fmd
-        progress_dialog = DownloadProgress:new{
-            title = _("下载中"),
-            on_cancel = function()
-                Log.info("[Koobone] 用户取消下载 fmd=" .. fmd)
-                self_ref._download_cancelled = true
-                -- 通过 IPC 文件通知子进程取消
-                self_ref.download:ipc_send_cancel(ipc_paths.cancel_file)
-                -- 关闭进度对话框
-                if progress_dialog then
-                    progress_dialog:close()
-                    progress_dialog = nil
-                end
-            end,
-            on_background = function()
-                Log.info("[Koobone] 后台运行下载 fmd=" .. fmd)
-                download_here = false
-                -- 关闭进度对话框，让下载在后台继续
-                if progress_dialog then
-                    progress_dialog:close()
-                    progress_dialog = nil
-                end
-                self_ref:showInfo(_("下载已转入后台"))
-            end,
-        }
-        if UIManager then
-            progress_dialog:show()
-        end
-        progress_dialog:setState{
-            stage = "prepare",
-            vol_name = tostring(vol_title),
-            percent = 0,
-        }
-    end
-
-    -- 父进程轮询子进程写入的进度文件，更新对话框
-    local function stop_polling()
-        if poll_handle and UIManager then
-            pcall(function() UIManager:unschedule(poll_handle) end)
-            poll_handle = nil
-        end
-    end
-    local function poll_progress()
-        if not progress_dialog then return end
-        local data = self_ref.download:ipc_read_progress(ipc_paths.progress_file)
-        if data then
-            progress_dialog:setState{
-                stage = data.stage,
-                vol_name = data.vol_name,
-                download_bytes = data.current,
-                expected_size = data.total,
-                message = data.message,
-            }
-        end
-        poll_handle = UIManager:scheduleIn(0.5, poll_progress)
-    end
-    if progress_dialog and UIManager then
-        poll_handle = UIManager:scheduleIn(0.5, poll_progress)
-    end
-
-    -- 在后台线程下载 EPUB 文件
-    self._download_cancelled = false
-    local download_task = Async.run(function()
-        -- 只下载 EPUB 文件，不解压
-        -- 通过 IPC 文件传递进度给父进程
-        local epub_path = self_ref.download:download_epub_file(vol, nil, self_ref, {
-            progress_file = ipc_paths.progress_file,
-            cancel_file = ipc_paths.cancel_file,
-        })
-        return epub_path
-    end, function(ok, epub_path, err)
-        -- 停止轮询
-        stop_polling()
-
-        -- 关闭进度对话框（如果还存在的话）
-        if progress_dialog then
-            progress_dialog:setState{ stage = "done", percent = 1 }
-            if UIManager then
-                progress_dialog:close()
-            end
-            progress_dialog = nil
-        end
-
-        -- 清理 IPC 文件
-        self_ref.download:ipc_cleanup(ipc_paths)
-
-        if self_ref._download_cancelled then
-            self_ref:showInfo(_("下载已取消"))
-            self_ref._download_cancelled = false
-            return
-        end
-
-        if not ok then
-            Log.error("[Koobone] download_comic async failed:", tostring(err))
-            self_ref:showInfo(_("下载失败: ") .. tostring(err or "未知错误"))
-            return
-        end
-        if epub_path then
-            local vol_title = (vol and (vol.title or vol.vol_name)) or fmd
-            self_ref:showInfo(T(_("《%1》下载完成！"), tostring(vol_title)))
-            if self_ref.book_list_menu then
-                ShelfView.refresh_current(self_ref.book_list_menu)
-            end
-        else
-            self_ref:showInfo(_("下载失败: ") .. tostring(err or "未知错误"))
-        end
-    end, { timeout = 600 })
-end
-
-function KoobonePlugin:showLog()
-    if not Log then
-        self:showInfo(_("日志模块未加载"))
-        return
-    end
-
-    local log_path
-    local ok_path, err_path = xpcall(function()
-        return Log.get_log_file_path()
-    end, debug.traceback)
-
-    if not ok_path or not log_path then
-        log_path = err_path and tostring(err_path) or nil
-    end
-
-    local log_content = ""
-    if log_path then
-        local f = io.open(log_path, "r")
-        if f then
-            log_content = f:read("*a") or ""
-            f:close()
-        end
-    end
-
-    if log_content == "" then
-        log_content = _("(日志文件为空或不存在)")
-        if log_path then
-            log_content = log_content .. "\n\n" .. T(_("日志路径: %1"), log_path)
-        end
-    end
-
-    if not TextViewer then
-        self:showInfo(log_content:sub(1, 500))
-        return
-    end
-
-    local viewer = TextViewer:new{
-        title = T(_("Koobone 日志"), self.version),
-        text = log_content,
-        text_type = "book_info",
-        justified = false,
-    }
-    UIManager:show(viewer)
+--- 本插件实例是不是「当前进度会话」的承载者？见 onCloseWidget 的完整说明。
+-- 注意形参名不叫 self：main.lua 里出现「以 self 为名的局部函数」会让静态检查工具
+-- 判定 self 被重绑定，从而整体跳过本文件的 self 方法检查（等于自废检查）。
+local function is_session_owner(plugin)
+    local reader = plugin.reader
+    return reader ~= nil
+        and type(reader.is_session_owner) == "function"
+        and reader:is_session_owner(plugin.ui)
 end
 
 function KoobonePlugin:onCloseWidget()
-    if self.reader then
-        pcall(function() self.reader:close_reader(false) end)
+    -- ⚠️ 这个钩子会在**四种**完全不同的时刻触发，只有其中一种该结束会话：
+    --   ① 书架/文件管理器打开一本漫画 —— FileManager:onShowingReader → FileManager:onClose()
+    --      → UIManager:close(FileManager) → CloseWidget 沿 propagateEvent 播到插件；
+    --   ② 阅读中换卷 —— ReaderUI:showReader 先 broadcastEvent("ShowingReader")
+    --      → **旧** ReaderUI:onShowingReader → onClose(false)，同样播到插件；
+    --   ③ 用户退出阅读（真正该结束会话并上传的那一次）；
+    --   ④ 插件所在 ui 的其它关闭路径。
+    -- ① 和 ② 都发生在 open_comic() 里 start_progress_session() **之后**，
+    -- 一律把新会话掐掉的话，30s 周期同步、云端进度拉取、关闭时推送、跳转到上次阅读页
+    -- 全部失效 —— 这才是「进度同步一直不生效」的真正根因。
+    --
+    -- ⚠️ 判据不能是「是不是 ReaderUI」：② 里关闭的旧 ReaderUI 也是 ReaderUI。
+    -- 只能是「归属」—— 见 koobone/reader.lua 的 claim_session：会话由承载它的那个
+    -- ReaderUI 实例上的插件在 onReaderReady 时认领，只有认领者关闭才算「用户离开了这本书」。
+    -- （也不看 self.ui.document：ReaderUI:onClose 是 closeDocument()（document=nil）之后才
+    --   UIManager:close(self)，轮到插件时 document 早就是 nil 了。）
+    --
+    -- 原实现两种情况都执行 close_reader(false)，除了上面的①/②误杀，还有第二个后果：
+    -- skip_upload=true 让「退出阅读时的最后一次推送」也永远不会发出。
+    if is_session_owner(self) then
+        pcall(function() self.reader:close_reader(true) end)
     end
     if self.book_list_menu then
         ShelfView.close(self.book_list_menu)
@@ -1035,13 +1012,64 @@ function KoobonePlugin:onCloseWidget()
     end
 end
 
+--- ReaderUI 文档加载完成：把当前进度会话认领到本实例的 ui 上（见 onCloseWidget / Reader:claim_session）。
+-- ⚠️ 必须返回 nil（不能返回 true）：事件沿 propagateEvent 传播，
+-- 返回 true 会截断后续模块的 onReaderReady（ReaderFooter / ReaderRolling 等都靠它）。
+function KoobonePlugin:onReaderReady()
+    if self.reader and type(self.reader.claim_session) == "function" then
+        pcall(function() self.reader:claim_session(self.ui) end)
+    end
+end
+
+--- 翻页：把当前页码实时喂给进度会话。
+--
+-- 为什么必须有这两个钩子：Progress 里的页码此前**只**由 30s 周期同步更新，
+-- 于是「退出阅读时的最后一次推送」推的是最多 30s 前的页码 —— 短时阅读（漫画常见：
+-- 翻几十页就退出）甚至会把「起始页」当成进度推上去，等于没推。
+-- 上游 readerpaging / readerrolling 每翻一页都派发 PageUpdate，滚动模式只派发 PosUpdate
+-- （PosUpdate 的第二个参数才是页码）—— 所以两个都要接，只接一个会在另一种模式下静默停滞。
+--
+-- 页码基准：PageUpdate/PosUpdate 给的是 document 的 0-based 页号，与 Progress 内部约定
+-- 一致（_upload_now 上传时 +1 转成云端 1-based），无需换算。
+-- 只走 update_local_progress（纯内存，不触发上传）：上传节奏仍由 start_session 里的
+-- interval 定时器统一负责，避免翻页时各自发请求。
+-- ⚠️ 全程不得抛错：这条路径在用户翻页的手势链上，异常会一路冒到 KOReader 事件循环。
+function KoobonePlugin:onPageUpdate(pageno)
+    local page = tonumber(pageno)
+    if not page or page < 0 then return end
+    if not is_session_owner(self) then return end
+    local prog = self.reader and self.reader._progress
+    if not prog then return end
+    pcall(function() prog:update_local_progress(page) end)
+end
+
+function KoobonePlugin:onPosUpdate(_pos, pageno)
+    -- 滚动模式只派发 PosUpdate：转发给 onPageUpdate，保证两条路都有页码。
+    if pageno ~= nil then
+        self:onPageUpdate(pageno)
+    end
+end
+
 function KoobonePlugin:onExit()
+    -- 退出应用：取消所有在途的异步子进程（卷目录 / 封面 / 进度拉取）。
+    --
+    -- ⚠️ 这一步**不能**放进 onCloseWidget：那个钩子在「从文件管理器打开一本书」时也会
+    -- 触发（FileManager:onShowingReader → FileManager:onClose → 事件传播到插件），
+    -- 而那一刻阅读会话的「自动拉取云端进度」刚刚发起 —— 一刀切会把自动拉取进度直接掐掉。
+    -- 只有真正退出 KOReader 才该全清。
+    --
+    -- ⚠️ 顺序：先掐在途异步，**再**收尾会话。反过来会自杀 ——
+    --    「退出 KOReader 时正在阅读」这条路径上，onCloseWidget 会走 close_reader(true)，
+    --    内部立刻发一个「最后一次进度上传」的子进程，紧接着的 cancel_all 正好把它杀掉。
+    if Async and Async.cancel_all then
+        pcall(function() Async.cancel_all() end)
+    end
     self:onCloseWidget()
     if self.settings then
         pcall(function() self.settings:flush() end)
     end
     if Log then
-        pcall(function() Log.flush() end)
+        pcall(function() Log._flush() end)
     end
 end
 
@@ -1068,7 +1096,21 @@ function KoobonePlugin:onGesture(ev)
     }
 
     if top_right_zone:match(ev) then
-        self:showSettings()
+        -- ⚠️ onGesture 由用户手势直接触发，任何 Lua error 都会冒泡到 KOReader 事件循环 → 整个进程崩溃。
+        -- 而 `showSettings` 在插件上从未定义过（设置项已挂在主菜单 addToMainMenu 下），
+        -- 原来的 `self:showSettings()` 必然抛 "attempt to call method 'showSettings' (a nil value)"。
+        -- 这里按「可选钩子」处理：有实现才调用，没有就记日志忽略，顺带保留将来补实现的挂点。
+        local show_settings = self.showSettings
+        if type(show_settings) == "function" then
+            local ok_g = pcall(show_settings, self)
+            if not ok_g and Log then
+                pcall(function() Log.warn("[Koobone] onGesture: showSettings 执行失败，已忽略") end)
+            end
+        elseif Log then
+            pcall(function()
+                Log.warn("[Koobone] onGesture: showSettings 未实现，忽略右上角下滑手势")
+            end)
+        end
         return true
     end
 
@@ -1093,7 +1135,7 @@ function KoobonePlugin:onShowToc()
             end, debug.traceback)
             if not ok then
                 local msg = "[Koobone] onShowToc step FAIL: " .. tostring(label) .. "\n" .. tostring(err)
-                if Log then pcall(function() Log.err(msg) end) end
+                if Log then pcall(function() Log.error(msg) end) end
                 pcall(function() UIManager:show(require("ui/widget/infomessage"):new{ text = tostring(msg), timeout = 8 }) end)
             end
         end
@@ -1142,7 +1184,7 @@ function KoobonePlugin:onShowToc()
                 return self.bookshelf:get_series_vols(sid_for_check)
             end, debug.traceback)
             if not ok_c then
-                if Log then pcall(function() Log.err("[Koobone] onShowToc: cache-hit check xpcall fail:\n" .. tostring(v)) end) end
+                if Log then pcall(function() Log.error("[Koobone] onShowToc: cache-hit check xpcall fail:\n" .. tostring(v)) end) end
             end
             if ok_c and v and #v > 0 then dir_cached = true end
         end
@@ -1155,7 +1197,11 @@ function KoobonePlugin:onShowToc()
             if Log then pcall(function() Log.info("[Koobone] onShowToc: CACHE MISS, going async") end) end
             -- 缓存未命中：先加载提示再异步拉目录，避免 showBookshelf 走同步 build_items
             -- 返回空 {} 然后显示"该系列无卷"（看起来像 bug）。目录拉完再 show。
-            local ok_a = ok_Async
+            -- 修复：原来这里读的是 `ok_Async`，而 main.lua 从未定义过该变量（只有 shelf_view.lua
+            -- 内部有同名 local，不跨文件）→ ok_a 恒为 nil → 整个异步加载分支永远走不到，
+            -- 每次都只弹"异步不可用"。Async 在本文件顶部已 require 且缺失即 return，
+            -- 这里只需问它自身可用性。
+            local ok_a = Async and Async.is_available and Async.is_available()
             if not ok_a then
                 self:showInfo(_("异步不可用"))
                 return true
@@ -1186,7 +1232,7 @@ function KoobonePlugin:onShowToc()
         return true  -- 吃掉 ShowToc 事件，阻止 ReaderToc 默认 EPUB 目录显示
     end, function(err)
         local msg = "[Koobone] onShowToc TOP FAIL:\n" .. tostring(err) .. "\n" .. tostring(debug.traceback())
-        if Log then pcall(function() Log.err(msg) end) end
+        if Log then pcall(function() Log.error(msg) end) end
         pcall(function() UIManager:show(require("ui/widget/infomessage"):new{ text = msg, timeout = 12 }) end)
         return true  -- 出错也返回 true：拦截默认 TOC，用户看到报错不至于直接闪退
     end)

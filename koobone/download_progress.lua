@@ -232,9 +232,6 @@ function DownloadProgress:setState(state)
     self:_redraw()
 end
 
-function DownloadProgress:isCanceled()
-    return self.cancelled
-end
 
 function DownloadProgress:show()
     if self._visible then return end

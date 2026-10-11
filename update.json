@@ -1,0 +1,16 @@
+{
+  "version": "1.4.0",
+  "name": "Koobone 漫画 1.4.0",
+  "channel": "stable",
+  "package_type": "full",
+  "package_url": "https://github.com/hesan1232/koobone.koplugin/releases/download/v1.4.0/koobone.koplugin.zip",
+  "package_urls": [
+    "https://github.com/hesan1232/koobone.koplugin/releases/download/v1.4.0/koobone.koplugin.zip",
+    "https://ghfast.top/https://github.com/hesan1232/koobone.koplugin/releases/download/v1.4.0/koobone.koplugin.zip",
+    "https://gh-proxy.com/https://github.com/hesan1232/koobone.koplugin/releases/download/v1.4.0/koobone.koplugin.zip",
+    "https://ghproxy.net/https://github.com/hesan1232/koobone.koplugin/releases/download/v1.4.0/koobone.koplugin.zip"
+  ],
+  "size": 161535,
+  "sha256": "fa8a4bf95b6d792bbab9e648bdfc6cc1afefec475f50a0a3ec5856e61180fc41",
+  "notes": "**新增：插件内「检查更新」与一键升级**（设计参考觅阅 miuread）\n\n- **检查更新**：菜单「Koobone 漫画 → 检查更新 → 立即检查更新」。从 GitHub Release 的\n  `update.json` 读最新版本号做语义化比对。清单里同时带 4 个下载地址（GitHub 原址 + 3 个国内\n  镜像），直连不通时自动换下一个。\n- **自动检查**：启动 5 秒后静默检查一次，默认 24 小时最多一次（可关、可改频率），同一个新版本\n  只提醒一次。**只在已联网时检查**，绝不主动开 WiFi。\n- **下载与安装**：下载后强制校验 SHA-256 → 解压到暂存目录并校验包结构与包内版本号 →\n  备份当前插件 → 替换 → 恢复用户配置。任何一步失败都自动回滚到旧版本。\n- **安装后重启**：可选「询问（默认）/ 自动重启 / 稍后手动」。重启后插件启动时比对\n  「期望版本 vs 实际运行版本」，一致才算更新成功并清掉回滚点；不一致则保留备份并给出回滚入口。\n- **保留用户配置**：`config.lua`（含 API Key）在升级时被完整保留。更新包本身也禁止含"
+}

@@ -3,7 +3,7 @@ local H = require("koobone.helper")
 local Koobone = require("koobone.koobone")
 
 local ok_info, Info = pcall(require, "koobone.info")
-local AUTH_VERSION = ok_info and Info and Info.version or "0.2.0"
+local AUTH_VERSION = ok_info and Info and Info.version or "1.4.0"
 
 local Auth = {}
 Auth.__index = Auth
@@ -81,9 +81,6 @@ function Auth:set_api_key(v)
     end
 end
 
-function Auth:is_logged_in()
-    return self:get_api_key() ~= ""
-end
 
 function Auth:clear()
     self.api_key = ""
